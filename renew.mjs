@@ -59,7 +59,9 @@ async function shot(page, name) {
 }
 
 async function sendTgPhoto(chat, token, photoPath, caption) {
-  if (!photoPath || !fs.existsSync(photoPath) || fs.statSync(photoPath).size < 100) return;
+  token = String(token || '').trim();
+  chat = String(chat || '').trim();
+  if (!photoPath || !fs.existsSync(photoPath) || fs.statSync(photoPath).size < 100 || !token || !chat) return;
   try {
     const form = new FormData();
     form.append('chat_id', chat);
@@ -74,8 +76,8 @@ async function sendTgPhoto(chat, token, photoPath, caption) {
 }
 
 async function tg(text, { photo = null } = {}) {
-  const token = process.env.TG_BOT_TOKEN;
-  const chat = process.env.TG_CHAT_ID;
+  const token = String(process.env.TG_BOT_TOKEN || '').trim();
+  const chat = String(process.env.TG_CHAT_ID || '').trim();
   if (!token || !chat) {
     log('未配置 TG_BOT_TOKEN/TG_CHAT_ID,跳过通知');
     return;
@@ -404,6 +406,70 @@ function classifyRenew(r) {
   return { ok: false, skip: false, captcha: false, text: `HTTP ${r.status} ${blob.slice(0, 180)}` };
 }
 
+function looksLikeRenewAction(text) {
+  const s = String(text || '').trim().toLowerCase();
+  if (!s) return false;
+  // 不要把说明文案/FAQ 的 "renewal/renouvellement" 当成按钮。
+  if (s.includes('?') || s.includes('renewal') || s.includes('renouvellement')) return false;
+  if (s.length > 90) return false;
+  return /\brenew\b/.test(s) || /\brenouveler\b/.test(s) || /\bextend\b/.test(s) || /续期|延长/.test(s);
+}
+
+async function findVisibleRenewButton(page, server) {
+  const locator = page.locator('button, a, [role="button"]');
+  const count = await locator.count();
+  const scored = [];
+
+  for (let i = 0; i < count; i++) {
+    const item = locator.nth(i);
+    const info = await item.evaluate((el) => {
+      const rect = el.getBoundingClientRect();
+      const style = window.getComputedStyle(el);
+      const text = [
+        el.innerText,
+        el.textContent,
+        el.getAttribute('aria-label'),
+        el.getAttribute('title'),
+        el.getAttribute('value'),
+      ].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
+      const card = el.closest('[data-server], [data-server-id], article, li, tr, .card, .client-card, .server, .project');
+      const cardText = (card?.innerText || card?.textContent || '').replace(/\s+/g, ' ').trim();
+      const disabled = el.disabled || el.getAttribute('aria-disabled') === 'true';
+      const busy = el.getAttribute('aria-busy') === 'true';
+      const visible = rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none' && style.opacity !== '0';
+      return { text, cardText, disabled, busy, visible, top: rect.top, left: rect.left };
+    }).catch(() => null);
+
+    if (!info || !looksLikeRenewAction(info.text) || info.disabled || info.busy || !info.visible) continue;
+
+    const haystack = `${info.cardText} ${info.text}`.toLowerCase();
+    let score = 100;
+    if (server?.id && haystack.includes(String(server.id).toLowerCase())) score += 50;
+    if (server?.uuid && haystack.includes(String(server.uuid).toLowerCase())) score += 40;
+    if (server?.name && haystack.includes(String(server.name).toLowerCase())) score += 30;
+    if (/^\s*(renew|renouveler|extend|续期|延长)\s*$/i.test(info.text)) score += 20;
+    score -= Math.max(0, info.top) / 1000;
+    scored.push({ item, info, score });
+  }
+
+  scored.sort((a, b) => b.score - a.score);
+  if (!scored.length) return null;
+  log(`选择可见续期按钮: ${JSON.stringify(scored[0].info.text).slice(0, 120)}`);
+  return scored[0].item;
+}
+
+async function clickRenewUi(page, server) {
+  const btn = await findVisibleRenewButton(page, server);
+  if (!btn) {
+    log('未找到可见可点击的 UI 续期按钮,跳过 UI 方案');
+    return false;
+  }
+  await btn.scrollIntoViewIfNeeded({ timeout: 3000 }).catch(() => {});
+  await btn.click({ timeout: 8000 });
+  await page.waitForTimeout(2000);
+  return true;
+}
+
 async function tryRenew(page, server) {
   const id = server.id;
   const name = server.name || id;
@@ -411,37 +477,40 @@ async function tryRenew(page, server) {
 
   if (DRY_RUN) return { id, ok: true, skip: true, text: `[DRY_RUN] ${name} (${id}) 跳过实际提交` };
 
-  // 1. UI 自动化续期
+  // 1. UI 自动化续期。注意：页面里可能存在隐藏的 Renew/Renouveler 按钮，不能用 .first().click()。
+  //    如果 UI 点击失败，不能直接让任务失败，应回退到 API 续期。
   await page.goto(`${BASE}/dashboard/projects`, { waitUntil: 'domcontentloaded' }).catch(() => {});
   await page.waitForTimeout(1500);
 
-  const renewBtn = page.locator('button:has-text("Renouveler"), button:has-text("Renew")').first();
-  const hasBtn = (await renewBtn.count()) > 0;
+  try {
+    const clicked = await clickRenewUi(page, server);
+    if (clicked) {
+      log(`已点击可见 UI 续期按钮,等待结果...`);
 
-  if (hasBtn) {
-    log(`找到 UI 续期按钮,执行点击...`);
-    await renewBtn.click();
-    await page.waitForTimeout(2000);
-
-    const modal = page.locator("[role='dialog']");
-    if ((await modal.count()) > 0) {
-      log('检测到防机器人人机验证弹窗,开始过盾...');
-      try {
-        await solveCaptcha(page, "[role='dialog']");
-        await page.waitForTimeout(4000);
-      } catch (e) {
-        log(`弹窗验证码处理异常: ${e.message}`);
+      const modal = page.locator("[role='dialog']");
+      if ((await modal.count()) > 0 && await modal.first().isVisible().catch(() => false)) {
+        log('检测到防机器人人机验证弹窗,开始过盾...');
+        try {
+          await solveCaptcha(page, "[role='dialog']");
+          await page.waitForTimeout(4000);
+        } catch (e) {
+          log(`弹窗验证码处理异常: ${e.message}`);
+        }
       }
-    }
 
-    // 验证 UI 结果
-    const bodyText = await page.evaluate(() => document.body.innerText);
-    if (/Expire dans\s+[2-9]j/i.test(bodyText) || /renouvellement sera disponible/i.test(bodyText)) {
-      const match = bodyText.match(/Expire dans\s+([0-9]+j(?:\s+[0-9]+h)?)/i);
-      const exp = match ? `剩余 ${match[1]}` : '成功延期';
-      log(`UI 续期验证成功: ${exp}`);
-      return { id, ok: true, skip: false, text: `${name} (${id}): 续期成功 (${exp})` };
+      // 验证 UI 结果
+      const bodyText = await page.evaluate(() => document.body.innerText);
+      if (/Expire dans\s+[2-9]j/i.test(bodyText) || /renouvellement sera disponible/i.test(bodyText)) {
+        const match = bodyText.match(/Expire dans\s+([0-9]+j(?:\s+[0-9]+h)?)/i);
+        const exp = match ? `剩余 ${match[1]}` : '成功延期';
+        log(`UI 续期验证成功: ${exp}`);
+        return { id, ok: true, skip: false, text: `${name} (${id}): 续期成功 (${exp})` };
+      }
+      log('UI 点击后未确认续期成功,继续尝试 API 续期接口');
     }
+  } catch (e) {
+    log(`UI 续期按钮点击失败,改走 API 续期: ${e.message}`);
+    await shot(page, `ui-click-fallback-${id}.png`).catch(() => {});
   }
 
   // 2. API 直接续期及验证码补发
