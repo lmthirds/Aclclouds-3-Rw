@@ -912,6 +912,20 @@ async function discover(page) {
     if (matched.length > 0) servers = matched;
   }
 
+  if (!servers.length) {
+    // 未发现任何服务时，落盘当前页面 HTML 以便排查抓取/选择器是否失效
+    try {
+      const html = await page.content();
+      fs.writeFileSync(path.join(SHOT, 'dashboard-debug.html'), html);
+      log('未发现任何服务，已保存页面 HTML 至 shots/dashboard-debug.html 以便排查');
+    } catch (e) {
+      log('保存调试 HTML 失败: ' + e.message);
+    }
+    if (!SERVER_ID) {
+      log('提示: 未设置 ACL_SERVER_ID，且自动抓取未发现任何服务 - 请在仓库 Secrets 中设置 ACL_SERVER_ID');
+    }
+  }
+
   const serverLogStr = servers
     .map((s) => {
       const exp = s.expiresAt ? s.expiresAt : s.canRenew ? '现在可续期' : '未知';
