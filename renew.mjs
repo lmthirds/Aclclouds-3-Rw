@@ -21,7 +21,7 @@ const VOCAB = [
   'Host', 'Hosting', 'Container', 'Project', 'Database', 'Backup', 'Web'
 ];
 
-const OCR_MIN_SCORE = Math.max(30, Math.min(100, Number.parseInt(process.env.ACL_CAPTCHA_OCR_MIN_SCORE || '50', 10)));
+const OCR_MIN_SCORE = Math.max(30, Math.min(100, Number.parseInt(process.env.ACL_CAPTCHA_OCR_MIN_SCORE || '55', 10)));
 const CAPTCHA_MAX_ATTEMPTS = Math.max(1, Math.min(6, Number.parseInt(process.env.ACL_CAPTCHA_MAX_ATTEMPTS || '4', 10)));
 
 fs.mkdirSync(SHOT, { recursive: true });
@@ -238,8 +238,8 @@ async function ocrPick(dir, prompt, n) {
   if (!results[0]) throw new Error('OCR 无结果: ' + prompt);
   if (results[0].vsPrompt < OCR_MIN_SCORE) {
     const secondScore = results[1]?.vsPrompt ?? 0;
-    if (results[0].vsPrompt >= 35 && results[0].vsPrompt - secondScore >= 15) {
-      log('OCR 分数(' + results[0].vsPrompt + ')低于阈值(' + OCR_MIN_SCORE + ')但领先第二名,兜底选择 option ' + results[0].i);
+    if (results[0].vsPrompt >= 40 && results[0].vsPrompt - secondScore >= 20) {
+      log('OCR 分数(' + results[0].vsPrompt + ')低于阈值(' + OCR_MIN_SCORE + ')但明显领先,兜底选择 option ' + results[0].i);
       return results[0].i;
     }
     throw new Error('OCR 未匹配 ' + prompt + ' (阈值:' + OCR_MIN_SCORE + '): ' + JSON.stringify(results));
@@ -247,107 +247,81 @@ async function ocrPick(dir, prompt, n) {
   return results[0].i;
 }
 
-async function api(page, p, method = 'GET', body, extraHeaders = {}) {
-  const fullUrl = p.startsWith('http') ? p : BASE + (p.startsWith('/') ? '' : '/') + p;
-  return page.evaluate(
-    async ({ fullUrl, method, body, extraHeaders }) => {
-      try {
-        const token = document.cookie
-          .split('; ')
-          .find((c) => c.startsWith('XSRF-TOKEN='))
-          ?.split('=')[1];
-        const metaCsrf = document.querySelector('meta[name="csrf-token"]')?.getAttribute('content');
+async function solveCaptcha(page, prefix = '') {
+  const root = prefix ? prefix + ' ' : '';
+  const checkbox = page.locator(root + "div[role='checkbox']").first();
 
-        // 部分站点的 /api/* 接口不是靠 Cookie 会话鉴权，而是要求前端自己在登录后
-        // 把拿到的 token 存进 localStorage/sessionStorage，再以 Authorization: Bearer 头带上。
-        // 这里自动扫描常见命名的字段，尽量兼容这种情况。
-        let bearerToken = null;
-        let bearerKeyFound = null;
-        const tokenKeyRe = /token|jwt|bearer/i;
-        try {
-          for (const store of [window.localStorage, window.sessionStorage]) {
-            for (let i = 0; i < store.length; i++) {
-              const k = store.key(i);
-              if (!k || !tokenKeyRe.test(k) || /csrf|xsrf/i.test(k)) continue;
-              let v = store.getItem(k);
-              if (!v) continue;
-              try {
-                const parsed = JSON.parse(v);
-                v = parsed.token || parsed.access_token || parsed.accessToken || parsed.api_token || v;
-              } catch {}
-              if (typeof v === 'string' && v.length > 10) {
-                bearerToken = v;
-                bearerKeyFound = k;
-                break;
-              }
-            }
-            if (bearerToken) break;
-          }
-        } catch {}
-
-        const headers = {
-          Accept: 'application/json',
-          'X-Requested-With': 'XMLHttpRequest',
-          ...(token ? { 'X-XSRF-TOKEN': decodeURIComponent(token) } : {}),
-          ...(metaCsrf ? { 'X-CSRF-TOKEN': metaCsrf } : {}),
-          ...(body ? { 'Content-Type': 'application/json' } : {}),
-          ...(bearerToken ? { Authorization: 'Bearer ' + bearerToken } : {}),
-          ...extraHeaders,
-        };
-
-        const res = await fetch(fullUrl, {
-          method,
-          headers,
-          body: body ? JSON.stringify(body) : undefined,
-          credentials: 'include',
-          redirect: 'follow',
-        });
-        const text = await res.text();
-        let data;
-        try {
-          data = JSON.parse(text);
-        } catch {
-          data = text.slice(0, 400);
-        }
-
-        // 401 时附带诊断信息 (只带字段名，不带值) 方便定位到底缺的是会话 Cookie 还是 Token
-        let diag;
-        if (res.status === 401) {
-          diag = {
-            cookieNames: document.cookie.split('; ').map((c) => c.split('=')[0]).filter(Boolean),
-            localStorageKeys: Object.keys(window.localStorage || {}),
-            sessionStorageKeys: Object.keys(window.sessionStorage || {}),
-            usedBearerKey: bearerKeyFound,
-          };
-        }
-
-        return { status: res.status, url: res.url, redirected: res.redirected, data, diag };
-      } catch (err) {
-        return { status: 0, url: fullUrl, redirected: false, data: { error: err.message } };
-      }
-    },
-    { fullUrl, method, body, extraHeaders }
-  );
-}
-
-async function logAuthStorageDiag(page, label) {
-  try {
-    const diag = await page.evaluate(() => ({
-      cookieNames: document.cookie.split('; ').map((c) => c.split('=')[0]).filter(Boolean),
-      localStorageKeys: Object.keys(window.localStorage || {}),
-      sessionStorageKeys: Object.keys(window.sessionStorage || {}),
-    }));
-    log(
-      '[' + label + '] 鉴权信息: cookie=[' + diag.cookieNames.join(',') +
-        '] localStorage=[' + diag.localStorageKeys.join(',') +
-        '] sessionStorage=[' + diag.sessionStorageKeys.join(',') + ']'
-    );
-  } catch (e) {
-    log('[' + label + '] 读取鉴权诊断信息失败: ' + e.message);
+  if (await checkbox.isVisible().catch(() => false)) {
+    const isChecked = await checkbox.getAttribute('aria-checked').catch(() => null);
+    if (isChecked === 'true') {
+      log('验证码已处于通过状态');
+      return;
+    }
+    await checkbox.click();
   }
+
+  const passedDirectly = await page
+    .waitForFunction(
+      (sel) => document.querySelector(sel)?.getAttribute('aria-checked') === 'true',
+      root + "div[role='checkbox']",
+      { timeout: 3000 }
+    )
+    .then(() => true)
+    .catch(() => false);
+
+  if (passedDirectly) {
+    log('UI 验证码点击后直接无感通过');
+    return;
+  }
+
+  await page.waitForSelector(root + '.auth-captcha-option-img', { timeout: 20000 });
+  await page.waitForFunction(
+    (sel) => {
+      const imgs = [...document.querySelectorAll(sel)];
+      return imgs.length > 0 && imgs.every((i) => i.naturalWidth > 0 && i.clientHeight > 0);
+    },
+    root + '.auth-captcha-option-img',
+    { timeout: 20000 }
+  );
+
+  const promptRaw = await page.locator(root + '.auth-captcha-prompt').first().innerText();
+  const prompt = promptRaw
+    .replace(/^(?:Click on|Cliquez sur|Select|Choisissez)\s*(?:the|le|la|l')?\s*/i, '')
+    .replace(/[.:!?\s]+$/, '')
+    .trim();
+
+  const imgs = page.locator(root + '.auth-captcha-option-img');
+  const n = await imgs.count();
+  const dir = path.join(SHOT, 'captcha');
+  fs.mkdirSync(dir, { recursive: true });
+
+  for (let i = 0; i < n; i++) {
+    const src = await imgs.nth(i).getAttribute('src');
+    const url = src.startsWith('http') ? src : BASE + (src.startsWith('/') ? '' : '/') + src;
+    const bytes = await page.evaluate(async (u) => {
+      const r = await fetch(u, { credentials: 'include' });
+      return Array.from(new Uint8Array(await r.arrayBuffer()));
+    }, url);
+    fs.writeFileSync(path.join(dir, i + '.png'), Buffer.from(bytes));
+  }
+
+  await shot(page, '02-captcha.png');
+  const pick = await ocrPick(dir, prompt, n);
+  await page.locator(root + '.auth-captcha-option').nth(pick).evaluate((el) => el.click());
+
+  await page.waitForFunction(
+    (sel) => {
+      const cb = document.querySelector(sel);
+      if (!cb) return true;
+      return cb.getAttribute('aria-checked') === 'true';
+    },
+    root + "div[role='checkbox']",
+    { timeout: 15000 }
+  );
+  log('验证码通过: ' + prompt + ' -> option ' + (pick + 1));
 }
 
-async function solveCaptchaApi(page, context = 'login') {
+async function solveCaptchaApi(page, context = 'renewal_gate') {
   log('通过 API 求解验证码 (context: ' + context + ')...');
   let lastErr = null;
 
@@ -378,7 +352,7 @@ async function solveCaptchaApi(page, context = 'login') {
 
       const ver = initialVerify.data;
       if (ver.passed && ver.token) {
-        log('API 验证码无感直通成功');
+        log('验证码无感直通成功');
         return ver.token;
       }
 
@@ -451,166 +425,50 @@ async function solveCaptchaApi(page, context = 'login') {
   throw new Error('API 验证码连续失败 ' + CAPTCHA_MAX_ATTEMPTS + ' 次: ' + lastMsg);
 }
 
-async function injectCaptchaToken(page, token) {
-  await page.evaluate((tok) => {
-    // 1. 注入页面所有可能存储 captcha token 的隐藏 input
-    // (实测该站点真实字段名是 cap-token，不含 "captcha" 这个词，所以要显式加上，
-    //  不能只靠 input[type="hidden"] 兜底 —— 如果它不是 type=hidden 就会漏掉)
-    const inputs = document.querySelectorAll(
-      'input[name*="captcha" i], input[id*="captcha" i], input[data-captcha], input[type="hidden"], input[name="cap-token" i]'
-    );
-    inputs.forEach((inp) => {
-      const name = (inp.name || inp.id || '').toLowerCase();
-      if (name.includes('captcha') || name.includes('token')) {
-        if (name !== '_token' && name !== 'csrf_token') {
-          inp.value = tok;
-          inp.dispatchEvent(new Event('input', { bubbles: true }));
-          inp.dispatchEvent(new Event('change', { bubbles: true }));
+async function api(page, p, method = 'GET', body, extraHeaders = {}) {
+  const fullUrl = p.startsWith('http') ? p : BASE + (p.startsWith('/') ? '' : '/') + p;
+  return page.evaluate(
+    async ({ fullUrl, method, body, extraHeaders }) => {
+      try {
+        const token = document.cookie
+          .split('; ')
+          .find((c) => c.startsWith('XSRF-TOKEN='))
+          ?.split('=')[1];
+        const metaCsrf = document.querySelector('meta[name="csrf-token"]')?.getAttribute('content');
+
+        const headers = {
+          Accept: 'application/json',
+          'X-Requested-With': 'XMLHttpRequest',
+          ...(token ? { 'X-XSRF-TOKEN': decodeURIComponent(token) } : {}),
+          ...(metaCsrf && !token ? { 'X-CSRF-TOKEN': metaCsrf } : {}),
+          ...(body ? { 'Content-Type': 'application/json' } : {}),
+          ...extraHeaders,
+        };
+
+        const res = await fetch(fullUrl, {
+          method,
+          headers,
+          body: body ? JSON.stringify(body) : undefined,
+          credentials: 'include',
+        });
+        const text = await res.text();
+        let data;
+        try {
+          data = JSON.parse(text);
+        } catch {
+          data = text.slice(0, 400);
         }
+        return { status: res.status, data };
+      } catch (err) {
+        return { status: 0, data: { error: err.message } };
       }
-    });
-
-    // 2. 向所有 form 追加常见名称的隐藏字段
-    document.querySelectorAll('form').forEach((form) => {
-      for (const fieldName of ['cap-token', 'captcha_token', 'captcha', 'auth_captcha_token', 'g-recaptcha-response']) {
-        let field = form.querySelector('input[name="' + fieldName + '"]');
-        if (!field) {
-          field = document.createElement('input');
-          field.type = 'hidden';
-          field.name = fieldName;
-          form.appendChild(field);
-        }
-        field.value = tok;
-      }
-    });
-
-    // 3. 将 checkbox 状态设为 true 并派发自定义事件
-    const cb = document.querySelector("div[role='checkbox']");
-    if (cb) {
-      cb.setAttribute('aria-checked', 'true');
-      cb.classList.add('checked', 'is-checked', 'verified', 'passed');
-      cb.dispatchEvent(new CustomEvent('captcha-verified', { detail: { token: tok }, bubbles: true }));
-      cb.dispatchEvent(new CustomEvent('verified', { detail: tok, bubbles: true }));
-    }
-
-    // 4. 强制解除所有提交按钮的 disabled 状态
-    document.querySelectorAll("button[type='submit'], input[type='submit'], .auth-submit-btn").forEach((btn) => {
-      btn.removeAttribute('disabled');
-      btn.disabled = false;
-      btn.setAttribute('aria-disabled', 'false');
-    });
-
-    window.__captchaToken = tok;
-  }, token);
-}
-
-async function solveCaptcha(page, prefix = '', apiContext = 'login') {
-  const root = prefix ? prefix + ' ' : '';
-
-  // 尝试用原生鼠标坐标点击 checkbox，触发前端真實鼠标事件
-  try {
-    const cbLoc = page.locator(root + "div[role='checkbox'], " + root + '.auth-captcha-checkbox, ' + root + '.auth-captcha-box').first();
-    if ((await cbLoc.count()) > 0) {
-      const isChecked = await cbLoc.getAttribute('aria-checked').catch(() => null);
-      if (isChecked === 'true') {
-        log('UI 验证码已处于通过状态');
-        return 'ui_already_passed';
-      }
-      await cbLoc.scrollIntoViewIfNeeded({ timeout: 3000 }).catch(() => {});
-      const box = await cbLoc.boundingBox().catch(() => null);
-      if (box && box.width > 0 && box.height > 0) {
-        await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
-        await page.waitForTimeout(120);
-        await page.mouse.down();
-        await page.waitForTimeout(80);
-        await page.mouse.up();
-      } else {
-        await cbLoc.click({ force: true, timeout: 4000 }).catch(() => {});
-      }
-    }
-  } catch (e) {
-    log('点击验证码复选框异常: ' + e.message);
-  }
-
-  // 检查是否点击后 2 秒内直接无感通过
-  const passedDirectly = await page
-    .waitForFunction(
-      (sel) => document.querySelector(sel)?.getAttribute('aria-checked') === 'true',
-      root + "div[role='checkbox']",
-      { timeout: 2000 }
-    )
-    .then(() => true)
-    .catch(() => false);
-
-  if (passedDirectly) {
-    log('UI 验证码点击后直接无感通过');
-    return 'ui_direct_passed';
-  }
-
-  // 等待验证码选项图片出现（最多等 5 秒，若不出现立即走 API 直通）
-  const hasImg = await page
-    .waitForSelector(root + '.auth-captcha-option-img', { timeout: 5000 })
-    .then(() => true)
-    .catch(() => false);
-
-  if (!hasImg) {
-    log('UI 验证码图片未弹出,切换为 API 验证码直通模式...');
-    const token = await solveCaptchaApi(page, apiContext);
-    await injectCaptchaToken(page, token);
-    log('已通过 API 求解并向页面注入验证码 Token');
-    return token;
-  }
-
-  await page.waitForFunction(
-    (sel) => {
-      const imgs = [...document.querySelectorAll(sel)];
-      return imgs.length > 0 && imgs.every((i) => i.naturalWidth > 0 && i.clientHeight > 0);
     },
-    root + '.auth-captcha-option-img',
-    { timeout: 12000 }
+    { fullUrl, method, body, extraHeaders }
   );
-
-  const promptRaw = await page.locator(root + '.auth-captcha-prompt').first().innerText();
-  const prompt = promptRaw
-    .replace(/^(?:Click on|Cliquez sur|Select|Choisissez)\s*(?:the|le|la|l')?\s*/i, '')
-    .replace(/[.:!?\s]+$/, '')
-    .trim();
-
-  const imgs = page.locator(root + '.auth-captcha-option-img');
-  const n = await imgs.count();
-  const dir = path.join(SHOT, 'captcha');
-  fs.mkdirSync(dir, { recursive: true });
-
-  for (let i = 0; i < n; i++) {
-    const src = await imgs.nth(i).getAttribute('src');
-    const url = src.startsWith('http') ? src : BASE + (src.startsWith('/') ? '' : '/') + src;
-    const bytes = await page.evaluate(async (u) => {
-      const r = await fetch(u, { credentials: 'include' });
-      return Array.from(new Uint8Array(await r.arrayBuffer()));
-    }, url);
-    fs.writeFileSync(path.join(dir, i + '.png'), Buffer.from(bytes));
-  }
-
-  await shot(page, '02-captcha.png');
-  const pick = await ocrPick(dir, prompt, n);
-  await page.locator(root + '.auth-captcha-option').nth(pick).evaluate((el) => el.click());
-
-  await page.waitForFunction(
-    (sel) => {
-      const cb = document.querySelector(sel);
-      if (!cb) return true;
-      return cb.getAttribute('aria-checked') === 'true';
-    },
-    root + "div[role='checkbox']",
-    { timeout: 12000 }
-  );
-  log('UI 验证码通过: ' + prompt + ' -> option ' + (pick + 1));
-  return 'ui_ocr_passed';
 }
 
 async function loggedIn(page) {
-  const url = page.url();
-  if (/\/dashboard/i.test(url) && !/\/auth\/login/i.test(url)) return true;
+  if (/\/dashboard/i.test(page.url()) && !/\/auth\/login/i.test(page.url())) return true;
   const r = await api(page, '/api/client/account');
   if (r.status === 200 && (r.data?.object === 'user' || r.data?.attributes || r.data?.id || r.data?.username)) {
     return true;
@@ -627,135 +485,6 @@ async function fillLoginCredentials(page) {
   await passLoc.fill(PASS);
 }
 
-async function submitLoginFallback(page, captchaToken) {
-  log('执行直接登录提交 (携带验证码 Token)...');
-
-  // 方式 A: 使用页面真实 Form 字段构造 URLSearchParams 提交 (兼容传统 Laravel/PHP/Node 表单登录)
-  const formRes = await page.evaluate(
-    async ({ user, pass, tok }) => {
-      try {
-        const form = document.querySelector('form');
-        const action = form?.getAttribute('action') || window.location.href;
-        const params = new URLSearchParams();
-        const originalFieldNames = [];
-
-        if (form) {
-          const fd = new FormData(form);
-          for (const [k, v] of fd.entries()) {
-            params.set(k, String(v));
-            originalFieldNames.push(k);
-          }
-        }
-
-        // 确保账号密码与各类可能的字段名齐全
-        const userInput = document.querySelector('#username, input[name="username"], input[name="email"], input[name="identity"]');
-        const passInput = document.querySelector('#password, input[name="password"]');
-        if (userInput?.name) params.set(userInput.name, user);
-        if (passInput?.name) params.set(passInput.name, pass);
-        params.set('username', user);
-        params.set('email', user);
-        params.set('identity', user);
-        params.set('password', pass);
-
-        if (tok && !tok.startsWith('ui_')) {
-          params.set('cap-token', tok);
-          params.set('captcha_token', tok);
-          params.set('captcha', tok);
-          params.set('token', tok);
-          params.set('auth_captcha_token', tok);
-        }
-
-        const csrfMeta = document.querySelector('meta[name="csrf-token"]')?.getAttribute('content');
-        if (csrfMeta && !params.has('_token')) {
-          params.set('_token', csrfMeta);
-        }
-
-        const xsrfCookie = document.cookie
-          .split('; ')
-          .find((c) => c.startsWith('XSRF-TOKEN='))
-          ?.split('=')[1];
-
-        const r = await fetch(action, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/x-www-form-urlencoded',
-            Accept: 'text/html,application/xhtml+xml,application/json,*/*',
-            ...(xsrfCookie ? { 'X-XSRF-TOKEN': decodeURIComponent(xsrfCookie) } : {}),
-            ...(csrfMeta ? { 'X-CSRF-TOKEN': csrfMeta } : {}),
-          },
-          body: params.toString(),
-          credentials: 'include',
-          redirect: 'follow',
-        });
-        const bodyText = await r.text().catch(() => '');
-        return {
-          status: r.status,
-          url: r.url,
-          redirected: r.redirected,
-          bodyText: bodyText.slice(0, 600),
-          originalFieldNames,
-        };
-      } catch (e) {
-        return { status: 0, error: e.message };
-      }
-    },
-    { user: USER, pass: PASS, tok: captchaToken || '' }
-  );
-
-  log(
-    '表单 POST 结果: status=' + formRes.status + ' url=' + (formRes.url || '') +
-      ' 表单原始字段=[' + (formRes.originalFieldNames || []).join(',') + ']'
-  );
-  if (formRes.status !== 200 && formRes.status !== 302) {
-    log('表单 POST 响应体: ' + (formRes.bodyText || formRes.error || ''));
-  }
-  if (formRes.url && /\/dashboard/i.test(formRes.url)) {
-    await page.goto(BASE + '/dashboard', { waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
-    if (await loggedIn(page)) return true;
-  }
-
-  // 方式 B: JSON API POST 尝试常见登录端点
-  const payload = {
-    username: USER,
-    email: USER,
-    identity: USER,
-    password: PASS,
-    ...(captchaToken && !captchaToken.startsWith('ui_')
-      ? {
-          'cap-token': captchaToken,
-          captcha_token: captchaToken,
-          captcha: captchaToken,
-          token: captchaToken,
-          auth_captcha_token: captchaToken,
-        }
-      : {}),
-  };
-
-  for (const endpoint of ['/auth/login', '/api/auth/login', '/auth/login/submit']) {
-    const r = await api(page, endpoint, 'POST', payload, {
-      ...(captchaToken ? { 'X-Captcha-Token': captchaToken } : {}),
-    });
-    log('JSON 登录尝试 ' + endpoint + ': HTTP ' + r.status + ' ' + JSON.stringify(r.data).slice(0, 300));
-    if (r.status === 200 || r.status === 204 || r.status === 302 || (r.url && /\/dashboard/i.test(r.url))) {
-      await page.goto(BASE + '/dashboard', { waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
-      if (await loggedIn(page)) return true;
-    }
-  }
-
-  // 方式 C: 直接在 DOM 中调用 form.submit() 原生提交
-  await page
-    .evaluate(() => {
-      const form = document.querySelector('form');
-      if (form) HTMLFormElement.prototype.submit.call(form);
-    })
-    .catch(() => {});
-  await page.waitForTimeout(3500);
-  if (!page.url().includes('/dashboard')) {
-    await page.goto(BASE + '/dashboard', { waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
-  }
-  return await loggedIn(page);
-}
-
 async function login(page) {
   log('登录 ' + BASE + ' as ' + USER);
   await page.goto(BASE + '/dashboard', { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
@@ -764,7 +493,6 @@ async function login(page) {
   if (await loggedIn(page)) {
     log('已有有效会话,跳过登录验证码');
     await page.context().storageState({ path: AUTH }).catch(() => {});
-    await logAuthStorageDiag(page, '复用会话');
     return;
   }
 
@@ -774,80 +502,37 @@ async function login(page) {
   }
 
   await page.goto(BASE + '/auth/login', { waitUntil: 'domcontentloaded', timeout: 30000 });
-  await page.waitForTimeout(1000);
-
-  // 诊断结果显示登录后只有 XSRF-TOKEN 一个 Cookie、localStorage 里也没有任何 token 字段，
-  // 这是典型的 Laravel Sanctum "SPA 鉴权" 场景: 必须先 GET /sanctum/csrf-cookie 预热，
-  // 登录时产生的会话才会被 Sanctum 标记为 stateful，后续 /api/* 请求才会被认成已登录；
-  // 否则即使登录表单提交成功、网页能正常打开，所有 API 调用也会一直是 401。
-  const csrfPrime = await api(page, '/sanctum/csrf-cookie').catch(() => ({ status: 0 }));
-  log('预热 Sanctum CSRF 端点 /sanctum/csrf-cookie: HTTP ' + csrfPrime.status);
-  await page.waitForTimeout(300);
-
   await fillLoginCredentials(page);
   await shot(page, '01-login.png');
 
   let authed = false;
-  let captchaToken = null;
   for (let i = 0; i < 4 && !authed; i++) {
     try {
-      captchaToken = await solveCaptcha(page, '', 'login');
+      await solveCaptcha(page);
       authed = true;
     } catch (e) {
       log('登录验证码失败(' + (i + 1) + '/4): ' + e.message);
-      await shot(page, '01-login-fail-' + (i + 1) + '.png');
       await page.goto(BASE + '/auth/login', { waitUntil: 'domcontentloaded' });
-      await page.waitForTimeout(1000);
       await fillLoginCredentials(page);
     }
   }
   if (!authed) throw new Error('登录验证码连续 4 次失败');
 
-  // 尝试点击提交按钮（移除 disabled 后使用 evaluate 点击 + 5秒短超时，绝不卡死）
-  const submitBtn = page.locator("button[type='submit'], input[type='submit'], .auth-submit-btn").first();
-  await submitBtn
-    .evaluate((el) => {
-      el.removeAttribute('disabled');
-      el.disabled = false;
-      el.click();
-    })
-    .catch(() => {});
+  const submitBtn = page.locator("button[type='submit'], input[type='submit']").first();
+  await submitBtn.click();
 
-  const redirected = await page
-    .waitForFunction(() => !window.location.pathname.includes('/auth/login'), { timeout: 6000 })
-    .then(() => true)
-    .catch(() => false);
-
-  if (!redirected && !(await loggedIn(page))) {
-    // 验证码 token 大概率是一次性的/有效期很短：第一次点击提交按钮那次尝试
-    // 很可能已经把它用掉了(或者已经过期)，这里复用同一个 token 去走表单/JSON
-    // 兜底提交几乎必然会被判定 "Captcha incorrect"。所以这里不再有条件地复用，
-    // 而是每次都重新求解一个全新的 token，并且求解完立刻提交，尽量缩短有效期窗口。
-    log('首次提交按钮点击未能登录成功,重新求解验证码后再走表单/JSON 兜底提交...');
-    const freshToken = await solveCaptchaApi(page, 'login').catch((e) => {
-      log('兜底提交前重新求解验证码失败,改用旧 token: ' + e.message);
-      return null;
+  await page
+    .waitForFunction(() => !window.location.pathname.includes('/auth/login'), { timeout: 25000 })
+    .catch(async () => {
+      if (!(await loggedIn(page))) {
+        const errText = await page.locator('.alert, .error, [role="alert"], .text-red-500').first().innerText().catch(() => '');
+        const extra = errText ? ' (' + errText.trim() + ')' : '';
+        throw new Error('登录后未跳转到 dashboard' + extra);
+      }
     });
-    if (freshToken) {
-      captchaToken = freshToken;
-      await injectCaptchaToken(page, captchaToken);
-    }
-    await submitLoginFallback(page, captchaToken);
-  }
-
-  if (!(await loggedIn(page))) {
-    const errText = await page.locator('.alert, .error, [role="alert"], .text-red-500').first().innerText().catch(() => '');
-    const extra = errText ? ' (' + errText.trim() + ')' : '';
-    throw new Error('登录后仍未进入 dashboard' + extra);
-  }
 
   await page.context().storageState({ path: AUTH });
   log('登录成功,会话写入 ' + AUTH);
-  await logAuthStorageDiag(page, '新登录');
-
-  // 不信任 URL 跳转，直接拿 /api/client/account 验证这个会话对 API 到底是不是真的已鉴权
-  const verify = await api(page, '/api/client/account').catch((e) => ({ status: 0, data: { error: e.message } }));
-  log('登录后直接验证 /api/client/account: HTTP ' + verify.status + ' ' + JSON.stringify(verify.data).slice(0, 300));
 }
 
 function formatRemaining(expiresAt) {
@@ -855,7 +540,7 @@ function formatRemaining(expiresAt) {
   const target = new Date(expiresAt).getTime();
   const diff = target - Date.now();
   if (isNaN(diff)) return null;
-  if (diff <= 0) return '已到期 (可立即续期)';
+  if (diff <= 0) return '已到期';
   const d = Math.floor(diff / 86400000);
   const h = Math.floor((diff % 86400000) / 3600000);
   const expStr = new Date(target).toLocaleString('zh-CN', {
@@ -879,9 +564,9 @@ async function discover(page) {
     map.set(id, {
       id,
       uuid: s.uuid || existing.uuid || id,
-      name: s.name && s.name !== id ? s.name : existing.name || id,
+      name: s.name || existing.name || id,
       expiresAt: s.expiresAt || existing.expiresAt || null,
-      canRenew: Boolean(s.canRenew || existing.canRenew),
+      canRenew: s.canRenew ?? existing.canRenew ?? false,
     });
   };
 
@@ -889,37 +574,6 @@ async function discover(page) {
     addServer({ id: SERVER_ID, uuid: SERVER_ID, name: SERVER_ID });
   }
 
-  // 途径 1: 扫描 /dashboard 首页的 "Upcoming renewals" 表格 (对应 ID: 39326029, Model: Cibsapoas)
-  if (!page.url().includes('/dashboard')) {
-    await page.goto(BASE + '/dashboard', { waitUntil: 'domcontentloaded' }).catch(() => {});
-  }
-  await page.waitForTimeout(1500);
-
-  const dashboardItems = await page
-    .evaluate(() => {
-      const results = [];
-      document.querySelectorAll('table tbody tr, tr').forEach((tr) => {
-        const tds = [...tr.querySelectorAll('td')];
-        if (tds.length >= 2) {
-          const idText = (tds[0].innerText || '').trim();
-          if (/^[a-z0-9_-]{4,20}$/i.test(idText) && !/^id$/i.test(idText)) {
-            const modelLines = (tds[1].innerText || '').split('\n').map((s) => s.trim()).filter(Boolean);
-            const name = modelLines[0] || idText;
-            const rowText = (tr.innerText || '').trim();
-            const canRenew = /Available:\s*Now|Renew|Renouveler/i.test(rowText);
-            results.push({ id: idText, name, canRenew });
-          }
-        }
-      });
-      return results;
-    })
-    .catch(() => []);
-
-  for (const item of dashboardItems) {
-    addServer(item);
-  }
-
-  // 途径 2: /api/client
   const r1 = await api(page, '/api/client');
   if (r1.status === 200) {
     const list = Array.isArray(r1.data?.data) ? r1.data.data : Array.isArray(r1.data?.servers) ? r1.data.servers : [];
@@ -938,7 +592,6 @@ async function discover(page) {
     }
   }
 
-  // 途径 3: /api/client/credits/subscriptions
   const r2 = await api(page, '/api/client/credits/subscriptions');
   if (r2.status === 200) {
     const rawList = Array.isArray(r2.data?.data)
@@ -969,7 +622,6 @@ async function discover(page) {
     }
   }
 
-  // 途径 4: 扫描 /dashboard/projects 页面 DOM 属性与链接
   await page.goto(BASE + '/dashboard/projects', { waitUntil: 'domcontentloaded' }).catch(() => {});
   await page.waitForTimeout(1500);
 
@@ -985,13 +637,11 @@ async function discover(page) {
       });
       document.querySelectorAll('a[href]').forEach((a) => {
         const href = a.getAttribute('href') || '';
-        const m = href.match(/\/(?:server|servers|projects)\/([a-z0-9]{6,16})(?:\/|$|\?)/i);
-        if (m && !['create', 'new', 'deploy'].includes(m[1].toLowerCase())) {
-          found.push(m[1]);
-        }
+        const m = href.match(/\/(?:server|servers|projects)\/([a-f0-9]{8})(?:\/|$|\?)/i);
+        if (m) found.push(m[1]);
       });
       const html = document.documentElement.innerHTML;
-      const regex = /"identifier"\s*:\s*"([a-z0-9]{6,16})"/gi;
+      const regex = /"identifier"\s*:\s*"([a-f0-9]{8})"/gi;
       let match;
       while ((match = regex.exec(html)) !== null) {
         found.push(match[1]);
@@ -1012,24 +662,10 @@ async function discover(page) {
     if (matched.length > 0) servers = matched;
   }
 
-  if (!servers.length) {
-    // 未发现任何服务时，落盘当前页面 HTML 以便排查抓取/选择器是否失效
-    try {
-      const html = await page.content();
-      fs.writeFileSync(path.join(SHOT, 'dashboard-debug.html'), html);
-      log('未发现任何服务，已保存页面 HTML 至 shots/dashboard-debug.html 以便排查');
-    } catch (e) {
-      log('保存调试 HTML 失败: ' + e.message);
-    }
-    if (!SERVER_ID) {
-      log('提示: 未设置 ACL_SERVER_ID，且自动抓取未发现任何服务 - 请在仓库 Secrets 中设置 ACL_SERVER_ID');
-    }
-  }
-
   const serverLogStr = servers
     .map((s) => {
-      const exp = s.expiresAt ? s.expiresAt : s.canRenew ? '现在可续期' : '未知';
-      return s.name + '(' + s.id + ') 状态:' + exp;
+      const exp = s.expiresAt ? s.expiresAt : '未知';
+      return s.name + '(' + s.id + ') 到期:' + exp;
     })
     .join(', ');
   log('发现服务: ' + (serverLogStr ? serverLogStr : '(无)'));
@@ -1064,14 +700,6 @@ function classifyRenew(r) {
   }
   if ((r.status === 403 || r.status === 400 || r.status === 422) && /captcha_required|captcha/i.test(blob)) {
     return { ok: false, skip: false, captcha: true, text: 'HTTP ' + r.status + ' captcha_required' };
-  }
-  if (r.status === 401) {
-    return {
-      ok: false,
-      skip: false,
-      captcha: false,
-      text: 'HTTP 401 鉴权失败 - 页面会话对该 API 无效,可能需要单独的 Token (详见上方 "API 401 诊断" 日志)',
-    };
   }
   return { ok: false, skip: false, captcha: false, text: 'HTTP ' + r.status + ' ' + blob.slice(0, 180) };
 }
@@ -1140,11 +768,12 @@ async function findVisibleRenewButton(page, server) {
   return scored[0].item;
 }
 
-async function clickRenewUiOnPage(page, url, server) {
-  await page.goto(url, { waitUntil: 'domcontentloaded' }).catch(() => {});
-  await page.waitForTimeout(1500);
+async function clickRenewUi(page, server) {
   const btn = await findVisibleRenewButton(page, server);
-  if (!btn) return false;
+  if (!btn) {
+    log('未找到可见可点击的 UI 续期按钮,跳过 UI 方案');
+    return false;
+  }
   await btn.scrollIntoViewIfNeeded({ timeout: 3000 }).catch(() => {});
   await btn.click({ timeout: 8000 });
   await page.waitForTimeout(2000);
@@ -1158,10 +787,12 @@ async function tryRenew(page, server) {
 
   if (DRY_RUN) return { id, ok: true, skip: true, text: '[DRY_RUN] ' + name + ' (' + id + ') 跳过实际提交' };
 
+  await page.goto(BASE + '/dashboard/projects', { waitUntil: 'domcontentloaded' }).catch(() => {});
+  await page.waitForTimeout(1500);
+
   let uiRenewRes = null;
   const responseHandler = async (res) => {
-    const u = res.url();
-    if ((u.includes('/renew') || u.includes('/upgrade')) && res.request().method() === 'POST') {
+    if (res.url().includes('/servers/' + id + '/upgrade/renew') && res.request().method() === 'POST') {
       try {
         const text = await res.text();
         let data;
@@ -1173,30 +804,20 @@ async function tryRenew(page, server) {
   page.on('response', responseHandler);
 
   try {
-    let clicked = await clickRenewUiOnPage(page, BASE + '/dashboard', server);
-    if (!clicked) {
-      clicked = await clickRenewUiOnPage(page, BASE + '/dashboard/projects', server);
-    }
-
+    const clicked = await clickRenewUi(page, server);
     if (clicked) {
       log('已点击可见 UI 续期按钮,等待结果...');
 
-      const modal = page.locator("[role='dialog'], .modal, .dialog");
+      const modal = page.locator("[role='dialog']");
       if ((await modal.count()) > 0 && (await modal.first().isVisible().catch(() => false))) {
         log('检测到防机器人人机验证弹窗,开始过盾...');
         try {
-          await solveCaptcha(page, "[role='dialog']", 'renewal_gate');
+          await solveCaptcha(page, "[role='dialog']");
           const confirmBtn = modal
             .locator("button[type='submit'], button:has-text('Renew'), button:has-text('Renouveler'), button:has-text('Confirm'), button:has-text('Valider')")
             .first();
-          if ((await confirmBtn.count()) > 0) {
-            await confirmBtn
-              .evaluate((el) => {
-                el.removeAttribute('disabled');
-                el.disabled = false;
-                el.click();
-              })
-              .catch(() => {});
+          if (await confirmBtn.isVisible().catch(() => false)) {
+            await confirmBtn.click().catch(() => {});
           }
           await page.waitForTimeout(3500);
         } catch (e) {
@@ -1213,11 +834,7 @@ async function tryRenew(page, server) {
       }
 
       const bodyText = await page.evaluate(() => document.body.innerText).catch(() => '');
-      if (
-        /Expire dans\s+[2-9]j/i.test(bodyText) ||
-        /renouvellement sera disponible/i.test(bodyText) ||
-        /renewed successfully|renewal successful/i.test(bodyText)
-      ) {
+      if (/Expire dans\s+[2-9]j/i.test(bodyText) || /renouvellement sera disponible/i.test(bodyText)) {
         const match = bodyText.match(/Expire dans\s+([0-9]+j(?:\s+[0-9]+h)?)/i);
         const exp = match ? '剩余 ' + match[1] : '成功延期';
         log('UI 续期验证成功: ' + exp);
@@ -1233,33 +850,8 @@ async function tryRenew(page, server) {
   }
 
   log('尝试 API 续期接口...');
-  const candidatePaths = [
-    '/api/client/servers/' + id + '/upgrade/renew',
-    '/api/client/projects/' + id + '/renew',
-    '/api/client/credits/subscriptions/' + id + '/renew',
-    '/dashboard/projects/' + id + '/renew',
-  ];
-
-  let r = { status: 404, data: {} };
-  let activePath = candidatePaths[0];
-
-  for (const p of candidatePaths) {
-    const res = await api(page, p, 'POST', {});
-    if (res.status === 401 && res.diag) {
-      log(
-        'API 401 诊断[' + p + ']: cookie=[' + res.diag.cookieNames.join(',') +
-          '] localStorage=[' + res.diag.localStorageKeys.join(',') +
-          '] sessionStorage=[' + res.diag.sessionStorageKeys.join(',') +
-          '] 已尝试的Token字段=' + (res.diag.usedBearerKey || '无')
-      );
-    }
-    if (res.status !== 404) {
-      r = res;
-      activePath = p;
-      break;
-    }
-  }
-
+  const renewPath = '/api/client/servers/' + id + '/upgrade/renew';
+  let r = await api(page, renewPath, 'POST', {});
   let c = classifyRenew(r);
 
   if (c.captcha) {
@@ -1274,7 +866,7 @@ async function tryRenew(page, server) {
       }
       r = await api(
         page,
-        activePath,
+        renewPath,
         'POST',
         { captcha_token: token, captcha: token, token },
         { 'X-Captcha-Token': token }
