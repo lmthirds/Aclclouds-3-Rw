@@ -258,12 +258,40 @@ async function api(page, p, method = 'GET', body, extraHeaders = {}) {
           ?.split('=')[1];
         const metaCsrf = document.querySelector('meta[name="csrf-token"]')?.getAttribute('content');
 
+        // 部分站点的 /api/* 接口不是靠 Cookie 会话鉴权，而是要求前端自己在登录后
+        // 把拿到的 token 存进 localStorage/sessionStorage，再以 Authorization: Bearer 头带上。
+        // 这里自动扫描常见命名的字段，尽量兼容这种情况。
+        let bearerToken = null;
+        let bearerKeyFound = null;
+        const tokenKeyRe = /token|jwt|bearer/i;
+        try {
+          for (const store of [window.localStorage, window.sessionStorage]) {
+            for (let i = 0; i < store.length; i++) {
+              const k = store.key(i);
+              if (!k || !tokenKeyRe.test(k) || /csrf|xsrf/i.test(k)) continue;
+              let v = store.getItem(k);
+              if (!v) continue;
+              try {
+                const parsed = JSON.parse(v);
+                v = parsed.token || parsed.access_token || parsed.accessToken || parsed.api_token || v;
+              } catch {}
+              if (typeof v === 'string' && v.length > 10) {
+                bearerToken = v;
+                bearerKeyFound = k;
+                break;
+              }
+            }
+            if (bearerToken) break;
+          }
+        } catch {}
+
         const headers = {
           Accept: 'application/json',
           'X-Requested-With': 'XMLHttpRequest',
           ...(token ? { 'X-XSRF-TOKEN': decodeURIComponent(token) } : {}),
           ...(metaCsrf ? { 'X-CSRF-TOKEN': metaCsrf } : {}),
           ...(body ? { 'Content-Type': 'application/json' } : {}),
+          ...(bearerToken ? { Authorization: 'Bearer ' + bearerToken } : {}),
           ...extraHeaders,
         };
 
@@ -281,13 +309,42 @@ async function api(page, p, method = 'GET', body, extraHeaders = {}) {
         } catch {
           data = text.slice(0, 400);
         }
-        return { status: res.status, url: res.url, redirected: res.redirected, data };
+
+        // 401 时附带诊断信息 (只带字段名，不带值) 方便定位到底缺的是会话 Cookie 还是 Token
+        let diag;
+        if (res.status === 401) {
+          diag = {
+            cookieNames: document.cookie.split('; ').map((c) => c.split('=')[0]).filter(Boolean),
+            localStorageKeys: Object.keys(window.localStorage || {}),
+            sessionStorageKeys: Object.keys(window.sessionStorage || {}),
+            usedBearerKey: bearerKeyFound,
+          };
+        }
+
+        return { status: res.status, url: res.url, redirected: res.redirected, data, diag };
       } catch (err) {
         return { status: 0, url: fullUrl, redirected: false, data: { error: err.message } };
       }
     },
     { fullUrl, method, body, extraHeaders }
   );
+}
+
+async function logAuthStorageDiag(page, label) {
+  try {
+    const diag = await page.evaluate(() => ({
+      cookieNames: document.cookie.split('; ').map((c) => c.split('=')[0]).filter(Boolean),
+      localStorageKeys: Object.keys(window.localStorage || {}),
+      sessionStorageKeys: Object.keys(window.sessionStorage || {}),
+    }));
+    log(
+      '[' + label + '] 鉴权信息: cookie=[' + diag.cookieNames.join(',') +
+        '] localStorage=[' + diag.localStorageKeys.join(',') +
+        '] sessionStorage=[' + diag.sessionStorageKeys.join(',') + ']'
+    );
+  } catch (e) {
+    log('[' + label + '] 读取鉴权诊断信息失败: ' + e.message);
+  }
 }
 
 async function solveCaptchaApi(page, context = 'login') {
@@ -688,6 +745,7 @@ async function login(page) {
   if (await loggedIn(page)) {
     log('已有有效会话,跳过登录验证码');
     await page.context().storageState({ path: AUTH }).catch(() => {});
+    await logAuthStorageDiag(page, '复用会话');
     return;
   }
 
@@ -748,6 +806,7 @@ async function login(page) {
 
   await page.context().storageState({ path: AUTH });
   log('登录成功,会话写入 ' + AUTH);
+  await logAuthStorageDiag(page, '新登录');
 }
 
 function formatRemaining(expiresAt) {
@@ -965,6 +1024,14 @@ function classifyRenew(r) {
   if ((r.status === 403 || r.status === 400 || r.status === 422) && /captcha_required|captcha/i.test(blob)) {
     return { ok: false, skip: false, captcha: true, text: 'HTTP ' + r.status + ' captcha_required' };
   }
+  if (r.status === 401) {
+    return {
+      ok: false,
+      skip: false,
+      captcha: false,
+      text: 'HTTP 401 鉴权失败 - 页面会话对该 API 无效,可能需要单独的 Token (详见上方 "API 401 诊断" 日志)',
+    };
+  }
   return { ok: false, skip: false, captcha: false, text: 'HTTP ' + r.status + ' ' + blob.slice(0, 180) };
 }
 
@@ -1137,6 +1204,14 @@ async function tryRenew(page, server) {
 
   for (const p of candidatePaths) {
     const res = await api(page, p, 'POST', {});
+    if (res.status === 401 && res.diag) {
+      log(
+        'API 401 诊断[' + p + ']: cookie=[' + res.diag.cookieNames.join(',') +
+          '] localStorage=[' + res.diag.localStorageKeys.join(',') +
+          '] sessionStorage=[' + res.diag.sessionStorageKeys.join(',') +
+          '] 已尝试的Token字段=' + (res.diag.usedBearerKey || '无')
+      );
+    }
     if (res.status !== 404) {
       r = res;
       activePath = p;
