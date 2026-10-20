@@ -2,8 +2,8 @@ name: ACLClouds Auto Renew
 
 on:
   schedule:
-    # 每两天执行一次，对应北京时间 (UTC+8) 早上 07:28 (即 UTC 23:28)
-    - cron: '28 23 */2 * *'
+    # 每天执行一次，对应北京时间 (UTC+8) 早上 07:28 (即 UTC 23:28)
+    - cron: '28 23 * * *'
   workflow_dispatch: {}
 
 permissions:
@@ -32,17 +32,26 @@ jobs:
           restore-keys: |
             acl-session-
 
-      - name: Install
+      - name: Install dependencies
         run: |
           npm install
           npx playwright install --with-deps chromium
 
-      - name: Renew
+      - name: Run Auto Renew
         env:
           ACL_USERNAME: ${{ secrets.ACL_USERNAME }}
           ACL_PASSWORD: ${{ secrets.ACL_PASSWORD }}
           ACL_SERVER_ID: ${{ secrets.ACL_SERVER_ID }}
-          ACL_BASE_URL: ${{ vars.ACL_BASE_URL }}
+          ACL_BASE_URL: ${{ vars.ACL_BASE_URL || 'https://aclclouds.com' }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: node renew.mjs
+
+      - name: Upload Screenshots on Failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: renew-screenshots-${{ github.run_id }}
+          path: shots/
+          if-no-files-found: ignore
+          retention-days: 5
