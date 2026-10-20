@@ -635,11 +635,13 @@ async function submitLoginFallback(page, captchaToken) {
         const form = document.querySelector('form');
         const action = form?.getAttribute('action') || window.location.href;
         const params = new URLSearchParams();
+        const originalFieldNames = [];
 
         if (form) {
           const fd = new FormData(form);
           for (const [k, v] of fd.entries()) {
             params.set(k, String(v));
+            originalFieldNames.push(k);
           }
         }
 
@@ -682,7 +684,14 @@ async function submitLoginFallback(page, captchaToken) {
           credentials: 'include',
           redirect: 'follow',
         });
-        return { status: r.status, url: r.url, redirected: r.redirected };
+        const bodyText = await r.text().catch(() => '');
+        return {
+          status: r.status,
+          url: r.url,
+          redirected: r.redirected,
+          bodyText: bodyText.slice(0, 600),
+          originalFieldNames,
+        };
       } catch (e) {
         return { status: 0, error: e.message };
       }
@@ -690,7 +699,13 @@ async function submitLoginFallback(page, captchaToken) {
     { user: USER, pass: PASS, tok: captchaToken || '' }
   );
 
-  log('表单 POST 结果: status=' + formRes.status + ' url=' + (formRes.url || ''));
+  log(
+    '表单 POST 结果: status=' + formRes.status + ' url=' + (formRes.url || '') +
+      ' 表单原始字段=[' + (formRes.originalFieldNames || []).join(',') + ']'
+  );
+  if (formRes.status !== 200 && formRes.status !== 302) {
+    log('表单 POST 响应体: ' + (formRes.bodyText || formRes.error || ''));
+  }
   if (formRes.url && /\/dashboard/i.test(formRes.url)) {
     await page.goto(BASE + '/dashboard', { waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
     if (await loggedIn(page)) return true;
@@ -716,7 +731,7 @@ async function submitLoginFallback(page, captchaToken) {
     const r = await api(page, endpoint, 'POST', payload, {
       ...(captchaToken ? { 'X-Captcha-Token': captchaToken } : {}),
     });
-    log('JSON 登录尝试 ' + endpoint + ': HTTP ' + r.status);
+    log('JSON 登录尝试 ' + endpoint + ': HTTP ' + r.status + ' ' + JSON.stringify(r.data).slice(0, 300));
     if (r.status === 200 || r.status === 204 || r.status === 302 || (r.url && /\/dashboard/i.test(r.url))) {
       await page.goto(BASE + '/dashboard', { waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
       if (await loggedIn(page)) return true;
@@ -816,6 +831,10 @@ async function login(page) {
   await page.context().storageState({ path: AUTH });
   log('登录成功,会话写入 ' + AUTH);
   await logAuthStorageDiag(page, '新登录');
+
+  // 不信任 URL 跳转，直接拿 /api/client/account 验证这个会话对 API 到底是不是真的已鉴权
+  const verify = await api(page, '/api/client/account').catch((e) => ({ status: 0, data: { error: e.message } }));
+  log('登录后直接验证 /api/client/account: HTTP ' + verify.status + ' ' + JSON.stringify(verify.data).slice(0, 300));
 }
 
 function formatRemaining(expiresAt) {
