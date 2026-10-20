@@ -819,9 +819,18 @@ async function login(page) {
     .catch(() => false);
 
   if (!redirected && !(await loggedIn(page))) {
-    if (!captchaToken || captchaToken.startsWith('ui_')) {
-      captchaToken = await solveCaptchaApi(page, 'login').catch(() => '');
-      if (captchaToken) await injectCaptchaToken(page, captchaToken);
+    // 验证码 token 大概率是一次性的/有效期很短：第一次点击提交按钮那次尝试
+    // 很可能已经把它用掉了(或者已经过期)，这里复用同一个 token 去走表单/JSON
+    // 兜底提交几乎必然会被判定 "Captcha incorrect"。所以这里不再有条件地复用，
+    // 而是每次都重新求解一个全新的 token，并且求解完立刻提交，尽量缩短有效期窗口。
+    log('首次提交按钮点击未能登录成功,重新求解验证码后再走表单/JSON 兜底提交...');
+    const freshToken = await solveCaptchaApi(page, 'login').catch((e) => {
+      log('兜底提交前重新求解验证码失败,改用旧 token: ' + e.message);
+      return null;
+    });
+    if (freshToken) {
+      captchaToken = freshToken;
+      await injectCaptchaToken(page, captchaToken);
     }
     await submitLoginFallback(page, captchaToken);
   }
