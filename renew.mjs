@@ -756,6 +756,15 @@ async function login(page) {
 
   await page.goto(BASE + '/auth/login', { waitUntil: 'domcontentloaded', timeout: 30000 });
   await page.waitForTimeout(1000);
+
+  // 诊断结果显示登录后只有 XSRF-TOKEN 一个 Cookie、localStorage 里也没有任何 token 字段，
+  // 这是典型的 Laravel Sanctum "SPA 鉴权" 场景: 必须先 GET /sanctum/csrf-cookie 预热，
+  // 登录时产生的会话才会被 Sanctum 标记为 stateful，后续 /api/* 请求才会被认成已登录；
+  // 否则即使登录表单提交成功、网页能正常打开，所有 API 调用也会一直是 401。
+  const csrfPrime = await api(page, '/sanctum/csrf-cookie').catch(() => ({ status: 0 }));
+  log('预热 Sanctum CSRF 端点 /sanctum/csrf-cookie: HTTP ' + csrfPrime.status);
+  await page.waitForTimeout(300);
+
   await fillLoginCredentials(page);
   await shot(page, '01-login.png');
 
