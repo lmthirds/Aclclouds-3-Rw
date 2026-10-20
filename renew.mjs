@@ -454,8 +454,10 @@ async function solveCaptchaApi(page, context = 'login') {
 async function injectCaptchaToken(page, token) {
   await page.evaluate((tok) => {
     // 1. 注入页面所有可能存储 captcha token 的隐藏 input
+    // (实测该站点真实字段名是 cap-token，不含 "captcha" 这个词，所以要显式加上，
+    //  不能只靠 input[type="hidden"] 兜底 —— 如果它不是 type=hidden 就会漏掉)
     const inputs = document.querySelectorAll(
-      'input[name*="captcha" i], input[id*="captcha" i], input[data-captcha], input[type="hidden"]'
+      'input[name*="captcha" i], input[id*="captcha" i], input[data-captcha], input[type="hidden"], input[name="cap-token" i]'
     );
     inputs.forEach((inp) => {
       const name = (inp.name || inp.id || '').toLowerCase();
@@ -470,7 +472,7 @@ async function injectCaptchaToken(page, token) {
 
     // 2. 向所有 form 追加常见名称的隐藏字段
     document.querySelectorAll('form').forEach((form) => {
-      for (const fieldName of ['captcha_token', 'captcha', 'auth_captcha_token', 'g-recaptcha-response']) {
+      for (const fieldName of ['cap-token', 'captcha_token', 'captcha', 'auth_captcha_token', 'g-recaptcha-response']) {
         let field = form.querySelector('input[name="' + fieldName + '"]');
         if (!field) {
           field = document.createElement('input');
@@ -656,6 +658,7 @@ async function submitLoginFallback(page, captchaToken) {
         params.set('password', pass);
 
         if (tok && !tok.startsWith('ui_')) {
+          params.set('cap-token', tok);
           params.set('captcha_token', tok);
           params.set('captcha', tok);
           params.set('token', tok);
@@ -719,6 +722,7 @@ async function submitLoginFallback(page, captchaToken) {
     password: PASS,
     ...(captchaToken && !captchaToken.startsWith('ui_')
       ? {
+          'cap-token': captchaToken,
           captcha_token: captchaToken,
           captcha: captchaToken,
           token: captchaToken,
