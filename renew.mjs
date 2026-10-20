@@ -262,7 +262,7 @@ async function api(page, p, method = 'GET', body, extraHeaders = {}) {
           Accept: 'application/json',
           'X-Requested-With': 'XMLHttpRequest',
           ...(token ? { 'X-XSRF-TOKEN': decodeURIComponent(token) } : {}),
-          ...(metaCsrf && !token ? { 'X-CSRF-TOKEN': metaCsrf } : {}),
+          ...(metaCsrf ? { 'X-CSRF-TOKEN': metaCsrf } : {}),
           ...(body ? { 'Content-Type': 'application/json' } : {}),
           ...extraHeaders,
         };
@@ -272,6 +272,7 @@ async function api(page, p, method = 'GET', body, extraHeaders = {}) {
           headers,
           body: body ? JSON.stringify(body) : undefined,
           credentials: 'include',
+          redirect: 'follow',
         });
         const text = await res.text();
         let data;
@@ -280,9 +281,9 @@ async function api(page, p, method = 'GET', body, extraHeaders = {}) {
         } catch {
           data = text.slice(0, 400);
         }
-        return { status: res.status, data };
+        return { status: res.status, url: res.url, redirected: res.redirected, data };
       } catch (err) {
-        return { status: 0, data: { error: err.message } };
+        return { status: 0, url: fullUrl, redirected: false, data: { error: err.message } };
       }
     },
     { fullUrl, method, body, extraHeaders }
@@ -402,31 +403,44 @@ async function injectCaptchaToken(page, token) {
     inputs.forEach((inp) => {
       const name = (inp.name || inp.id || '').toLowerCase();
       if (name.includes('captcha') || name.includes('token')) {
-        inp.value = tok;
-        inp.dispatchEvent(new Event('input', { bubbles: true }));
-        inp.dispatchEvent(new Event('change', { bubbles: true }));
+        if (name !== '_token' && name !== 'csrf_token') {
+          inp.value = tok;
+          inp.dispatchEvent(new Event('input', { bubbles: true }));
+          inp.dispatchEvent(new Event('change', { bubbles: true }));
+        }
       }
     });
 
-    // 2. 如果页面表单里没有任何 captcha input，动态追加隐藏字段
-    const form = document.querySelector('form');
-    if (form) {
-      for (const fieldName of ['captcha_token', 'captcha', 'auth_captcha_token']) {
-        if (!form.querySelector('input[name="' + fieldName + '"]')) {
-          const hidden = document.createElement('input');
-          hidden.type = 'hidden';
-          hidden.name = fieldName;
-          hidden.value = tok;
-          form.appendChild(hidden);
+    // 2. 向所有 form 追加常见名称的隐藏字段
+    document.querySelectorAll('form').forEach((form) => {
+      for (const fieldName of ['captcha_token', 'captcha', 'auth_captcha_token', 'g-recaptcha-response']) {
+        let field = form.querySelector('input[name="' + fieldName + '"]');
+        if (!field) {
+          field = document.createElement('input');
+          field.type = 'hidden';
+          field.name = fieldName;
+          form.appendChild(field);
         }
+        field.value = tok;
       }
-    }
+    });
 
-    // 3. 将 checkbox 状态设为 true
+    // 3. 将 checkbox 状态设为 true 并派发自定义事件
     const cb = document.querySelector("div[role='checkbox']");
     if (cb) {
       cb.setAttribute('aria-checked', 'true');
+      cb.classList.add('checked', 'is-checked', 'verified', 'passed');
+      cb.dispatchEvent(new CustomEvent('captcha-verified', { detail: { token: tok }, bubbles: true }));
+      cb.dispatchEvent(new CustomEvent('verified', { detail: tok, bubbles: true }));
     }
+
+    // 4. 强制解除所有提交按钮的 disabled 状态
+    document.querySelectorAll("button[type='submit'], input[type='submit'], .auth-submit-btn").forEach((btn) => {
+      btn.removeAttribute('disabled');
+      btn.disabled = false;
+      btn.setAttribute('aria-disabled', 'false');
+    });
+
     window.__captchaToken = tok;
   }, token);
 }
@@ -434,51 +448,49 @@ async function injectCaptchaToken(page, token) {
 async function solveCaptcha(page, prefix = '', apiContext = 'login') {
   const root = prefix ? prefix + ' ' : '';
 
-  // 先尝试点击 UI checkbox
+  // 尝试用原生鼠标坐标点击 checkbox，触发前端真實鼠标事件
   try {
-    const cbSelector = root + "div[role='checkbox'], " + root + '.auth-captcha-checkbox, ' + root + '.auth-captcha-box';
-    const checkbox = page.locator(cbSelector).first();
-    if ((await checkbox.count()) > 0) {
-      const isChecked = await checkbox.getAttribute('aria-checked').catch(() => null);
+    const cbLoc = page.locator(root + "div[role='checkbox'], " + root + '.auth-captcha-checkbox, ' + root + '.auth-captcha-box').first();
+    if ((await cbLoc.count()) > 0) {
+      const isChecked = await cbLoc.getAttribute('aria-checked').catch(() => null);
       if (isChecked === 'true') {
         log('UI 验证码已处于通过状态');
-        return;
+        return 'ui_already_passed';
       }
-      await checkbox.click({ force: true, timeout: 5000 }).catch(async () => {
-        await page.evaluate((sel) => {
-          const el = document.querySelector(sel);
-          if (el) el.click();
-        }, root + "div[role='checkbox']");
-      });
-    } else {
-      // 尝试按文本点击 "I am not a robot" / "Je ne suis pas un robot"
-      const robotText = page.locator('text=/not a robot|pas un robot/i').first();
-      if ((await robotText.count()) > 0) {
-        await robotText.click({ force: true, timeout: 5000 }).catch(() => {});
+      await cbLoc.scrollIntoViewIfNeeded({ timeout: 3000 }).catch(() => {});
+      const box = await cbLoc.boundingBox().catch(() => null);
+      if (box && box.width > 0 && box.height > 0) {
+        await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+        await page.waitForTimeout(120);
+        await page.mouse.down();
+        await page.waitForTimeout(80);
+        await page.mouse.up();
+      } else {
+        await cbLoc.click({ force: true, timeout: 4000 }).catch(() => {});
       }
     }
   } catch (e) {
     log('点击验证码复选框异常: ' + e.message);
   }
 
-  // 检查是否点击后 2.5 秒内直接无感通过
+  // 检查是否点击后 2 秒内直接无感通过
   const passedDirectly = await page
     .waitForFunction(
       (sel) => document.querySelector(sel)?.getAttribute('aria-checked') === 'true',
       root + "div[role='checkbox']",
-      { timeout: 2500 }
+      { timeout: 2000 }
     )
     .then(() => true)
     .catch(() => false);
 
   if (passedDirectly) {
     log('UI 验证码点击后直接无感通过');
-    return;
+    return 'ui_direct_passed';
   }
 
-  // 等待验证码选项图片出现（缩短超时至 7 秒，若不出现则立即走 API 求解通道）
+  // 等待验证码选项图片出现（最多等 5 秒，若不出现立即走 API 直通）
   const hasImg = await page
-    .waitForSelector(root + '.auth-captcha-option-img', { timeout: 7000 })
+    .waitForSelector(root + '.auth-captcha-option-img', { timeout: 5000 })
     .then(() => true)
     .catch(() => false);
 
@@ -534,6 +546,7 @@ async function solveCaptcha(page, prefix = '', apiContext = 'login') {
     { timeout: 12000 }
   );
   log('UI 验证码通过: ' + prompt + ' -> option ' + (pick + 1));
+  return 'ui_ocr_passed';
 }
 
 async function loggedIn(page) {
@@ -553,6 +566,118 @@ async function fillLoginCredentials(page) {
   await userLoc.waitFor({ state: 'visible', timeout: 15000 });
   await userLoc.fill(USER);
   await passLoc.fill(PASS);
+}
+
+async function submitLoginFallback(page, captchaToken) {
+  log('执行直接登录提交 (携带验证码 Token)...');
+
+  // 方式 A: 使用页面真实 Form 字段构造 URLSearchParams 提交 (兼容传统 Laravel/PHP/Node 表单登录)
+  const formRes = await page.evaluate(
+    async ({ user, pass, tok }) => {
+      try {
+        const form = document.querySelector('form');
+        const action = form?.getAttribute('action') || window.location.href;
+        const params = new URLSearchParams();
+
+        if (form) {
+          const fd = new FormData(form);
+          for (const [k, v] of fd.entries()) {
+            params.set(k, String(v));
+          }
+        }
+
+        // 确保账号密码与各类可能的字段名齐全
+        const userInput = document.querySelector('#username, input[name="username"], input[name="email"], input[name="identity"]');
+        const passInput = document.querySelector('#password, input[name="password"]');
+        if (userInput?.name) params.set(userInput.name, user);
+        if (passInput?.name) params.set(passInput.name, pass);
+        params.set('username', user);
+        params.set('email', user);
+        params.set('identity', user);
+        params.set('password', pass);
+
+        if (tok && !tok.startsWith('ui_')) {
+          params.set('captcha_token', tok);
+          params.set('captcha', tok);
+          params.set('token', tok);
+          params.set('auth_captcha_token', tok);
+        }
+
+        const csrfMeta = document.querySelector('meta[name="csrf-token"]')?.getAttribute('content');
+        if (csrfMeta && !params.has('_token')) {
+          params.set('_token', csrfMeta);
+        }
+
+        const xsrfCookie = document.cookie
+          .split('; ')
+          .find((c) => c.startsWith('XSRF-TOKEN='))
+          ?.split('=')[1];
+
+        const r = await fetch(action, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            Accept: 'text/html,application/xhtml+xml,application/json,*/*',
+            ...(xsrfCookie ? { 'X-XSRF-TOKEN': decodeURIComponent(xsrfCookie) } : {}),
+            ...(csrfMeta ? { 'X-CSRF-TOKEN': csrfMeta } : {}),
+          },
+          body: params.toString(),
+          credentials: 'include',
+          redirect: 'follow',
+        });
+        return { status: r.status, url: r.url, redirected: r.redirected };
+      } catch (e) {
+        return { status: 0, error: e.message };
+      }
+    },
+    { user: USER, pass: PASS, tok: captchaToken || '' }
+  );
+
+  log('表单 POST 结果: status=' + formRes.status + ' url=' + (formRes.url || ''));
+  if (formRes.url && /\/dashboard/i.test(formRes.url)) {
+    await page.goto(BASE + '/dashboard', { waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
+    if (await loggedIn(page)) return true;
+  }
+
+  // 方式 B: JSON API POST 尝试常见登录端点
+  const payload = {
+    username: USER,
+    email: USER,
+    identity: USER,
+    password: PASS,
+    ...(captchaToken && !captchaToken.startsWith('ui_')
+      ? {
+          captcha_token: captchaToken,
+          captcha: captchaToken,
+          token: captchaToken,
+          auth_captcha_token: captchaToken,
+        }
+      : {}),
+  };
+
+  for (const endpoint of ['/auth/login', '/api/auth/login', '/auth/login/submit']) {
+    const r = await api(page, endpoint, 'POST', payload, {
+      ...(captchaToken ? { 'X-Captcha-Token': captchaToken } : {}),
+    });
+    log('JSON 登录尝试 ' + endpoint + ': HTTP ' + r.status);
+    if (r.status === 200 || r.status === 204 || r.status === 302 || (r.url && /\/dashboard/i.test(r.url))) {
+      await page.goto(BASE + '/dashboard', { waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
+      if (await loggedIn(page)) return true;
+    }
+  }
+
+  // 方式 C: 直接在 DOM 中调用 form.submit() 原生提交
+  await page
+    .evaluate(() => {
+      const form = document.querySelector('form');
+      if (form) HTMLFormElement.prototype.submit.call(form);
+    })
+    .catch(() => {});
+  await page.waitForTimeout(3500);
+  if (!page.url().includes('/dashboard')) {
+    await page.goto(BASE + '/dashboard', { waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
+  }
+  return await loggedIn(page);
 }
 
 async function login(page) {
@@ -592,30 +717,27 @@ async function login(page) {
   }
   if (!authed) throw new Error('登录验证码连续 4 次失败');
 
-  const submitBtn = page.locator("button[type='submit'], input[type='submit']").first();
-  await submitBtn.click();
+  // 尝试点击提交按钮（移除 disabled 后使用 evaluate 点击 + 5秒短超时，绝不卡死）
+  const submitBtn = page.locator("button[type='submit'], input[type='submit'], .auth-submit-btn").first();
+  await submitBtn
+    .evaluate((el) => {
+      el.removeAttribute('disabled');
+      el.disabled = false;
+      el.click();
+    })
+    .catch(() => {});
 
   const redirected = await page
-    .waitForFunction(() => !window.location.pathname.includes('/auth/login'), { timeout: 15000 })
+    .waitForFunction(() => !window.location.pathname.includes('/auth/login'), { timeout: 6000 })
     .then(() => true)
     .catch(() => false);
 
   if (!redirected && !(await loggedIn(page))) {
-    // 如果表单点击提交被前端拦截（例如 API 拿到了 captchaToken 但前端 React/Vue state 没更新），直接通过 API POST 登录
-    log('表单点击未跳转,尝试使用验证码 Token 直接请求登录接口...');
-    if (!captchaToken) {
+    if (!captchaToken || captchaToken.startsWith('ui_')) {
       captchaToken = await solveCaptchaApi(page, 'login').catch(() => '');
+      if (captchaToken) await injectCaptchaToken(page, captchaToken);
     }
-    await api(page, '/auth/login', 'POST', {
-      username: USER,
-      email: USER,
-      password: PASS,
-      captcha_token: captchaToken,
-      captcha: captchaToken,
-      token: captchaToken,
-    });
-    await page.goto(BASE + '/dashboard', { waitUntil: 'domcontentloaded', timeout: 25000 }).catch(() => {});
-    await page.waitForTimeout(1500);
+    await submitLoginFallback(page, captchaToken);
   }
 
   if (!(await loggedIn(page))) {
@@ -667,7 +789,7 @@ async function discover(page) {
     addServer({ id: SERVER_ID, uuid: SERVER_ID, name: SERVER_ID });
   }
 
-  // 途径 1: 扫描 /dashboard 首页的 "Upcoming renewals" 表格 (对应你的截图: ID 39326029, Model Cibsapoas)
+  // 途径 1: 扫描 /dashboard 首页的 "Upcoming renewals" 表格 (对应 ID: 39326029, Model: Cibsapoas)
   if (!page.url().includes('/dashboard')) {
     await page.goto(BASE + '/dashboard', { waitUntil: 'domcontentloaded' }).catch(() => {});
   }
@@ -676,7 +798,6 @@ async function discover(page) {
   const dashboardItems = await page
     .evaluate(() => {
       const results = [];
-      // 扫描表格行
       document.querySelectorAll('table tbody tr, tr').forEach((tr) => {
         const tds = [...tr.querySelectorAll('td')];
         if (tds.length >= 2) {
@@ -930,7 +1051,6 @@ async function tryRenew(page, server) {
   page.on('response', responseHandler);
 
   try {
-    // 先在 /dashboard (Upcoming renewals 表格) 查找 Renew 按钮，若无再去 /dashboard/projects
     let clicked = await clickRenewUiOnPage(page, BASE + '/dashboard', server);
     if (!clicked) {
       clicked = await clickRenewUiOnPage(page, BASE + '/dashboard/projects', server);
@@ -947,8 +1067,14 @@ async function tryRenew(page, server) {
           const confirmBtn = modal
             .locator("button[type='submit'], button:has-text('Renew'), button:has-text('Renouveler'), button:has-text('Confirm'), button:has-text('Valider')")
             .first();
-          if (await confirmBtn.isVisible().catch(() => false)) {
-            await confirmBtn.click().catch(() => {});
+          if ((await confirmBtn.count()) > 0) {
+            await confirmBtn
+              .evaluate((el) => {
+                el.removeAttribute('disabled');
+                el.disabled = false;
+                el.click();
+              })
+              .catch(() => {});
           }
           await page.waitForTimeout(3500);
         } catch (e) {
@@ -984,12 +1110,12 @@ async function tryRenew(page, server) {
     page.off('response', responseHandler);
   }
 
-  // 2. API 直接续期及验证码补发 (兼容 servers 与 projects 路径)
   log('尝试 API 续期接口...');
   const candidatePaths = [
     '/api/client/servers/' + id + '/upgrade/renew',
     '/api/client/projects/' + id + '/renew',
     '/api/client/credits/subscriptions/' + id + '/renew',
+    '/dashboard/projects/' + id + '/renew',
   ];
 
   let r = { status: 404, data: {} };
