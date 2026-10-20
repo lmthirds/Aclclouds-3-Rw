@@ -394,6 +394,52 @@ async function solveCaptchaApi(page, context = 'login') {
   throw new Error('API 验证码连续失败 ' + CAPTCHA_MAX_ATTEMPTS + ' 次: ' + lastMsg);
 }
 
+async function injectCaptchaToken(page, token) {
+  await page.evaluate((tok) => {
+    // 注入页面所有可能存储 captcha token 的隐藏 input
+    const inputs = document.querySelectorAll(
+      'input[name*="captcha" i], input[id*="captcha" i], input[data-captcha], input[type="hidden"]'
+    );
+    inputs.forEach((inp) => {
+      const name = (inp.name || inp.id || '').toLowerCase();
+      if (name.includes('captcha') || name.includes('token')) {
+        if (name !== '_token' && name !== 'csrf_token') {
+          inp.value = tok;
+          inp.dispatchEvent(new Event('input', { bubbles: true }));
+          inp.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+      }
+    });
+
+    document.querySelectorAll('form').forEach((form) => {
+      for (const fieldName of ['captcha_token', 'captcha', 'auth_captcha_token', 'g-recaptcha-response']) {
+        let field = form.querySelector('input[name="' + fieldName + '"]');
+        if (!field) {
+          field = document.createElement('input');
+          field.type = 'hidden';
+          field.name = fieldName;
+          form.appendChild(field);
+        }
+        field.value = tok;
+      }
+    });
+
+    const cb = document.querySelector("div[role='checkbox']");
+    if (cb) {
+      cb.setAttribute('aria-checked', 'true');
+      cb.classList.add('checked', 'is-checked', 'verified', 'passed');
+    }
+
+    document.querySelectorAll("button[type='submit'], input[type='submit'], .auth-submit-btn").forEach((btn) => {
+      btn.removeAttribute('disabled');
+      btn.disabled = false;
+      btn.setAttribute('aria-disabled', 'false');
+    });
+
+    window.__captchaToken = tok;
+  }, token);
+}
+
 async function loggedIn(page) {
   const url = page.url();
   if (/\/dashboard/i.test(url) && !/\/auth\/login/i.test(url)) return true;
@@ -434,22 +480,23 @@ async function login(page) {
   await fillLoginCredentials(page);
   await shot(page, '01-login.png');
 
-  let captchaToken = await solveCaptchaApi(page, 'login');
+  const captchaToken = await solveCaptchaApi(page, 'login');
   log('已通过 API 求解登录验证码 token: ' + captchaToken);
 
-  // 直接使用 API 提交登录， 100% 绕过前端 DOM 按钮卡死
-  const loginRes = await api(page, '/auth/login', 'POST', {
-    username: USER,
-    email: USER,
-    identity: USER,
-    password: PASS,
-    captcha_token: captchaToken,
-    captcha: captchaToken,
-    token: captchaToken,
-    auth_captcha_token: captchaToken,
-  });
+  // 注入 Token 并点击页面真实的提交按钮触发完整表单提交
+  await injectCaptchaToken(page, captchaToken);
+  await page.waitForTimeout(600);
 
-  log('API 登录请求响应: HTTP ' + loginRes.status);
+  const submitBtn = page.locator("button[type='submit'], input[type='submit'], .auth-submit-btn").first();
+  await submitBtn
+    .evaluate((el) => {
+      el.removeAttribute('disabled');
+      el.disabled = false;
+      el.click();
+    })
+    .catch(() => {});
+
+  await page.waitForTimeout(4000);
   await page.goto(BASE + '/dashboard', { waitUntil: 'domcontentloaded', timeout: 25000 }).catch(() => {});
   await page.waitForTimeout(1500);
 
@@ -500,17 +547,14 @@ async function discover(page) {
     addServer({ id: SERVER_ID, uuid: SERVER_ID, name: SERVER_ID });
   }
 
-  // 途径 1: 全面扫描 /dashboard 首页表格与卡片中的所有纯数字 ID 和标识符
   await page.goto(BASE + '/dashboard', { waitUntil: 'domcontentloaded' }).catch(() => {});
   await page.waitForTimeout(2000);
 
   const dashboardItems = await page
     .evaluate(() => {
       const results = [];
-      // 遍历所有表格行和卡片
       document.querySelectorAll('tr, .card, .client-card, div').forEach((el) => {
         const text = el.innerText || '';
-        // 匹配 6 到 9 位数字 ID (例如 39326029)
         const m = text.match(/\b([0-9]{6,9})\b/);
         if (m) {
           const id = m[1];
@@ -526,7 +570,6 @@ async function discover(page) {
     addServer(item);
   }
 
-  // 途径 2: /api/client
   const r1 = await api(page, '/api/client');
   if (r1.status === 200) {
     const list = Array.isArray(r1.data?.data) ? r1.data.data : Array.isArray(r1.data?.servers) ? r1.data.servers : [];
@@ -545,7 +588,6 @@ async function discover(page) {
     }
   }
 
-  // 途径 3: /api/client/credits/subscriptions
   const r2 = await api(page, '/api/client/credits/subscriptions');
   if (r2.status === 200) {
     const rawList = Array.isArray(r2.data?.data)
@@ -576,7 +618,6 @@ async function discover(page) {
     }
   }
 
-  // 途径 4: 扫描 /dashboard/projects
   await page.goto(BASE + '/dashboard/projects', { waitUntil: 'domcontentloaded' }).catch(() => {});
   await page.waitForTimeout(1500);
 
@@ -764,7 +805,8 @@ async function tryRenew(page, server) {
       if ((await modal.count()) > 0 && (await modal.first().isVisible().catch(() => false))) {
         log('检测到防机器人人机验证弹窗,开始过盾...');
         try {
-          await solveCaptcha(page, "[role='dialog']", 'renewal_gate');
+          let token = await solveCaptchaApi(page, 'renewal_gate');
+          await injectCaptchaToken(page, token);
           const confirmBtn = modal
             .locator("button[type='submit'], button:has-text('Renew'), button:has-text('Renouveler'), button:has-text('Confirm'), button:has-text('Valider')")
             .first();
@@ -836,13 +878,7 @@ async function tryRenew(page, server) {
   if (c.captcha) {
     log('检测到 captcha_required,获取 renewal_gate 验证码凭据...');
     try {
-      let token;
-      try {
-        token = await solveCaptchaApi(page, 'renewal_gate');
-      } catch (errGate) {
-        log('renewal_gate 获取失败(' + errGate.message + '),尝试 login 上下文...');
-        token = await solveCaptchaApi(page, 'login');
-      }
+      let token = await solveCaptchaApi(page, 'renewal_gate');
       r = await api(
         page,
         activePath,
