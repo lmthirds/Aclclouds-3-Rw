@@ -757,7 +757,7 @@ async function findVisibleRenewButton(page, server) {
     if (server?.id && haystack.includes(String(server.id).toLowerCase())) s += 50;
     if (server?.uuid && haystack.includes(String(server.uuid).toLowerCase())) s += 40;
     if (server?.name && haystack.includes(String(server.name).toLowerCase())) s += 30;
-    if (/^\s*(renew|renouveler|extend|续期|延长)\s*$/i.test(info.text)) s += 20;
+    if (/^\s*(renew|renew now|renouveler|extend|续期|延长)\s*$/i.test(info.text)) s += 25;
     s -= Math.max(0, info.top) / 1000;
     scored.push({ item, info, score: s });
   }
@@ -780,6 +780,41 @@ async function clickRenewUi(page, server) {
   return true;
 }
 
+async function navigateToServerRenewPage(page, server) {
+  const id = server.id;
+  const candidateUrls = [
+    BASE + '/server/' + id,
+    BASE + '/dashboard/projects/' + id,
+    BASE + '/dashboard/projects',
+  ];
+
+  for (const url of candidateUrls) {
+    log('访问服务页面: ' + url);
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+    await page.waitForTimeout(2500);
+
+    // 如果当前页面已经能找到 Renew / Renew now 按钮，或者已经是 /server/{id} 控制台页面，直接停留在当前页
+    if (await findVisibleRenewButton(page, server)) {
+      return;
+    }
+    const bodyText = await page.evaluate(() => document.body.innerText).catch(() => '');
+    if (/Time remaining|Expire dans|Renewal will be available|renouvellement sera disponible|Server suspended/i.test(bodyText)) {
+      return;
+    }
+
+    // 如果在列表页且有 Manage 按钮，尝试点击进入
+    const manageBtn = page.locator('a:has-text("Manage"), button:has-text("Manage"), a:has-text("Gérer"), button:has-text("Gérer")').first();
+    if (await manageBtn.isVisible().catch(() => false)) {
+      log('点击 Manage 按钮进入详情页...');
+      await manageBtn.click({ timeout: 8000 }).catch(() => {});
+      await page.waitForTimeout(2500);
+      if (await findVisibleRenewButton(page, server)) {
+        return;
+      }
+    }
+  }
+}
+
 async function tryRenew(page, server) {
   const id = server.id;
   const name = server.name || id;
@@ -787,12 +822,18 @@ async function tryRenew(page, server) {
 
   if (DRY_RUN) return { id, ok: true, skip: true, text: '[DRY_RUN] ' + name + ' (' + id + ') 跳过实际提交' };
 
-  await page.goto(BASE + '/dashboard/projects', { waitUntil: 'domcontentloaded' }).catch(() => {});
-  await page.waitForTimeout(1500);
+  // 1. 直接进入真实的服务器控制台/续期页面 (/server/{id})
+  await navigateToServerRenewPage(page, server);
+  await shot(page, '05-server-page-' + id + '.png');
+
+  // 检查页面初始文本是否提示“未到续期窗口”
+  const initialBody = await page.evaluate(() => document.body.innerText).catch(() => '');
+  const notYetMatch = initialBody.match(/Renewal will be available[^\n.]*|renouvellement sera disponible[^\n.]*/i);
+  const timeRemMatch = initialBody.match(/(?:Time remaining|Expire dans)\s*:\s*([0-9]+[dj]\s*[0-9]*h?)/i);
 
   let uiRenewRes = null;
   const responseHandler = async (res) => {
-    if (res.url().includes('/servers/' + id + '/upgrade/renew') && res.request().method() === 'POST') {
+    if (res.url().includes('/renew') && res.request().method() === 'POST') {
       try {
         const text = await res.text();
         let data;
@@ -806,22 +847,41 @@ async function tryRenew(page, server) {
   try {
     const clicked = await clickRenewUi(page, server);
     if (clicked) {
-      log('已点击可见 UI 续期按钮,等待结果...');
+      log('已点击可见 UI 续期按钮, 等待 Anti-bot 验证码弹窗...');
+      await page.waitForTimeout(1500);
 
-      const modal = page.locator("[role='dialog']");
-      if ((await modal.count()) > 0 && (await modal.first().isVisible().catch(() => false))) {
-        log('检测到防机器人人机验证弹窗,开始过盾...');
+      const hasDialog = (await page.locator("[role='dialog']").count()) > 0 && (await page.locator("[role='dialog']").first().isVisible().catch(() => false));
+      const hasPageCaptcha = await page.locator("div[role='checkbox'], .auth-captcha-option-img").first().isVisible().catch(() => false);
+
+      if (hasDialog || hasPageCaptcha) {
+        const scope = hasDialog ? "[role='dialog']" : '';
+        log('检测到防机器人人机验证弹窗 (scope: ' + (scope || 'page') + '), 开始过盾...');
         try {
-          await solveCaptcha(page, "[role='dialog']");
-          const confirmBtn = modal
-            .locator("button[type='submit'], button:has-text('Renew'), button:has-text('Renouveler'), button:has-text('Confirm'), button:has-text('Valider')")
+          await solveCaptcha(page, scope);
+          log('验证码已通过，等待自动续期请求完成与页面刷新...');
+          await page.waitForTimeout(4500);
+
+          const confirmRoot = hasDialog ? page.locator("[role='dialog']") : page;
+          const confirmBtn = confirmRoot
+            .locator("button[type='submit'], button:has-text('Confirm'), button:has-text('Valider')")
             .first();
           if (await confirmBtn.isVisible().catch(() => false)) {
             await confirmBtn.click().catch(() => {});
+            await page.waitForTimeout(3000);
           }
-          await page.waitForTimeout(3500);
         } catch (e) {
           log('弹窗验证码处理异常: ' + e.message);
+        }
+      }
+
+      // 如果服务之前是 Suspended 恢复后处于 Offline 状态，自动点击右上角 Start 开机
+      const startBtn = page.locator("button:has-text('Start'), button:has-text('Démarrer')").first();
+      if (await startBtn.isVisible().catch(() => false)) {
+        const isDisabled = await startBtn.isDisabled().catch(() => false);
+        if (!isDisabled) {
+          log('检测到服务器处于 Offline 状态，自动点击 Start 按钮启动服务...');
+          await startBtn.click().catch(() => {});
+          await page.waitForTimeout(2000);
         }
       }
 
@@ -834,13 +894,21 @@ async function tryRenew(page, server) {
       }
 
       const bodyText = await page.evaluate(() => document.body.innerText).catch(() => '');
-      if (/Expire dans\s+[2-9]j/i.test(bodyText) || /renouvellement sera disponible/i.test(bodyText)) {
-        const match = bodyText.match(/Expire dans\s+([0-9]+j(?:\s+[0-9]+h)?)/i);
-        const exp = match ? '剩余 ' + match[1] : '成功延期';
+      const newRemMatch = bodyText.match(/(?:Time remaining|Expire dans)\s*:?\s*([0-9]+[dj](?:\s*[0-9]+h)?)/i);
+      if (
+        newRemMatch ||
+        /Renewal will be available/i.test(bodyText) ||
+        /renouvellement sera disponible/i.test(bodyText)
+      ) {
+        const exp = newRemMatch ? '剩余 ' + newRemMatch[1] : '成功延期';
         log('UI 续期验证成功: ' + exp);
         return { id, ok: true, skip: false, text: name + ' (' + id + '): 续期成功 (' + exp + ')' };
       }
       log('UI 点击后未确认续期成功,继续尝试 API 续期接口');
+    } else if (notYetMatch) {
+      const remStr = timeRemMatch ? timeRemMatch[1] : (formatRemaining(server.expiresAt) || '充足');
+      log('页面显示未到续期窗口 (' + notYetMatch[0] + '), 剩余: ' + remStr);
+      return { id, ok: true, skip: true, text: name + ' (' + id + '): 未到续期窗口，剩余 ' + remStr };
     }
   } catch (e) {
     log('UI 续期按钮点击失败,改走 API 续期: ' + e.message);
@@ -855,21 +923,22 @@ async function tryRenew(page, server) {
   let c = classifyRenew(r);
 
   if (c.captcha) {
-    log('检测到 captcha_required,获取 renewal_gate 验证码凭据...');
+    const reqContext = r.data?.context || r.data?.captcha_context || 'renewal_gate';
+    log('检测到 captcha_required,获取 ' + reqContext + ' 验证码凭据...');
     try {
       let token;
       try {
-        token = await solveCaptchaApi(page, 'renewal_gate');
+        token = await solveCaptchaApi(page, reqContext);
       } catch (errGate) {
-        log('renewal_gate 获取失败(' + errGate.message + '),尝试 login 上下文...');
+        log(reqContext + ' 获取失败(' + errGate.message + '),尝试 login 上下文...');
         token = await solveCaptchaApi(page, 'login');
       }
       r = await api(
         page,
         renewPath,
         'POST',
-        { captcha_token: token, captcha: token, token },
-        { 'X-Captcha-Token': token }
+        { captcha_token: token, captcha: token, token, captchaToken: token },
+        { 'X-Captcha-Token': token, 'X-Captcha': token }
       );
       c = classifyRenew(r);
     } catch (e) {
