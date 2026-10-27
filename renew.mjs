@@ -210,6 +210,17 @@ function formatTgMessage({ failed, results = [], errorMsg = '' }) {
   return lines.join('\n');
 }
 
+async function dismissCookieBanner(page) {
+  try {
+    const cookieBtn = page.locator("button:has-text('Accept all'), button:has-text('Reject all'), button:has-text('Tout accepter'), button:has-text('Tout refuser')").first();
+    if (await cookieBtn.isVisible({ timeout: 1500 }).catch(() => false)) {
+      log('关闭左下角 Cookie 弹窗...');
+      await cookieBtn.click({ timeout: 3000 }).catch(() => {});
+      await page.waitForTimeout(500);
+    }
+  } catch {}
+}
+
 async function ocrPick(dir, prompt, n) {
   const worker = await Tesseract.createWorker('eng');
   await worker.setParameters({
@@ -247,78 +258,194 @@ async function ocrPick(dir, prompt, n) {
   return results[0].i;
 }
 
-async function solveCaptcha(page, prefix = '') {
-  const root = prefix ? prefix + ' ' : '';
-  const checkbox = page.locator(root + "div[role='checkbox']").first();
+// 检查页面或 Shadow DOM 中的 Cap / 传统验证码是否已经完成
+async function isCaptchaSolved(page, rootSelector = '') {
+  return page.evaluate((rootSel) => {
+    const scope = (rootSel && document.querySelector(rootSel)) || document;
 
-  if (await checkbox.isVisible().catch(() => false)) {
-    const isChecked = await checkbox.getAttribute('aria-checked').catch(() => null);
-    if (isChecked === 'true') {
-      log('验证码已处于通过状态');
-      return;
+    // 1. 检查传统 aria-checked
+    const roleCb = scope.querySelector("[role='checkbox']");
+    if (roleCb && roleCb.getAttribute('aria-checked') === 'true') return true;
+
+    // 2. 检查隐藏的 token input 是否已经有值
+    const inputs = scope.querySelectorAll('input[name*="captcha"], input[name*="cap"], input[name*="token"]');
+    for (const inp of inputs) {
+      if (inp.value && inp.value.trim().length > 15) return true;
     }
-    await checkbox.click();
+
+    // 3. 检查 <cap-widget> Web Component 属性或 Shadow DOM 状态
+    const capWidget = scope.querySelector('cap-widget, [data-cap], .cap-widget');
+    if (capWidget) {
+      if (capWidget.getAttribute('data-state') === 'verified' || capWidget.hasAttribute('verified')) return true;
+      if (capWidget.value && String(capWidget.value).length > 10) return true;
+      const sr = capWidget.shadowRoot;
+      if (sr) {
+        const srCb = sr.querySelector("[role='checkbox'], input[type='checkbox'], .checkbox, button");
+        if (srCb && (srCb.getAttribute('aria-checked') === 'true' || srCb.checked === true || srCb.classList.contains('verified') || srCb.classList.contains('checked') || srCb.classList.contains('success'))) {
+          return true;
+        }
+        const srText = (sr.textContent || '').toLowerCase();
+        if (srText.includes('verified') || srText.includes('human verified') || srText.includes('vérifié')) {
+          return true;
+        }
+      }
+    }
+
+    // 4. 检查页面可见文字是否变成了 Verified
+    const allText = (scope.innerText || '').toLowerCase();
+    if (allText.includes("you're human") === false && (allText.includes('verified') || allText.includes('vérifié'))) {
+      return true;
+    }
+    return false;
+  }, rootSelector).catch(() => false);
+}
+
+// 兼容新版 Cap 组件 (Verify you're human) 与旧版图片验证码
+async function solveCaptcha(page, prefix = '', apiContext = 'login') {
+  await dismissCookieBanner(page);
+  const root = prefix ? prefix + ' ' : '';
+
+  if (await isCaptchaSolved(page, prefix)) {
+    log('验证码已处于通过状态');
+    return null;
   }
 
-  const passedDirectly = await page
-    .waitForFunction(
-      (sel) => document.querySelector(sel)?.getAttribute('aria-checked') === 'true',
-      root + "div[role='checkbox']",
-      { timeout: 3000 }
-    )
-    .then(() => true)
-    .catch(() => false);
+  // 1. 尝试多种方式点击 "Verify you're human" / Cap 复选框 (支持穿透 Shadow DOM)
+  let clicked = false;
+  const clickTargets = [
+    page.locator(root + "text=/Verify you're human|Vérifiez que vous êtes humain/i").first(),
+    page.locator(root + "cap-widget").first(),
+    page.locator(root + "div[role='checkbox']").first(),
+    page.locator(root + "input[type='checkbox']").first(),
+  ];
 
-  if (passedDirectly) {
-    log('UI 验证码点击后直接无感通过');
-    return;
+  for (const loc of clickTargets) {
+    if (await loc.isVisible().catch(() => false)) {
+      log('找到可见验证码组件，执行点击...');
+      try {
+        // 先尝试点击元素左侧复选框位置或中心
+        const box = await loc.boundingBox().catch(() => null);
+        if (box && box.width > 100) {
+          // 点击左侧复选框区域 (距离左边缘 28px, 垂直居中)
+          await page.mouse.click(box.x + 28, box.y + box.height / 2);
+        } else {
+          await loc.click({ timeout: 5000, force: true });
+        }
+        clicked = true;
+        break;
+      } catch (e) {
+        log('常规点击验证码异常: ' + e.message);
+      }
+    }
   }
 
-  await page.waitForSelector(root + '.auth-captcha-option-img', { timeout: 20000 });
-  await page.waitForFunction(
-    (sel) => {
-      const imgs = [...document.querySelectorAll(sel)];
-      return imgs.length > 0 && imgs.every((i) => i.naturalWidth > 0 && i.clientHeight > 0);
-    },
-    root + '.auth-captcha-option-img',
-    { timeout: 20000 }
-  );
+  // 同时通过 JS 穿透 Shadow DOM 触发内部 checkbox/button 点击兜底
+  await page.evaluate((rootSel) => {
+    const scope = (rootSel && document.querySelector(rootSel)) || document;
+    const cap = scope.querySelector('cap-widget');
+    if (cap && cap.shadowRoot) {
+      const btn = cap.shadowRoot.querySelector('input[type="checkbox"], [role="checkbox"], button, .checkbox, label');
+      if (btn) btn.click();
+    }
+  }, prefix).catch(() => {});
 
-  const promptRaw = await page.locator(root + '.auth-captcha-prompt').first().innerText();
-  const prompt = promptRaw
-    .replace(/^(?:Click on|Cliquez sur|Select|Choisissez)\s*(?:the|le|la|l')?\s*/i, '')
-    .replace(/[.:!?\s]+$/, '')
-    .trim();
+  log('已触发验证码点击，等待 Cap 算力验证或图片加载...');
 
-  const imgs = page.locator(root + '.auth-captcha-option-img');
-  const n = await imgs.count();
-  const dir = path.join(SHOT, 'captcha');
-  fs.mkdirSync(dir, { recursive: true });
+  // 2. 循环等待 12 秒：看是否直接无感通过 (Cap PoW 算力验证通常在 2~8 秒内完成)，或者是否弹出了传统 4 图选择框
+  const startTime = Date.now();
+  let hasImgOptions = false;
 
-  for (let i = 0; i < n; i++) {
-    const src = await imgs.nth(i).getAttribute('src');
-    const url = src.startsWith('http') ? src : BASE + (src.startsWith('/') ? '' : '/') + src;
-    const bytes = await page.evaluate(async (u) => {
-      const r = await fetch(u, { credentials: 'include' });
-      return Array.from(new Uint8Array(await r.arrayBuffer()));
-    }, url);
-    fs.writeFileSync(path.join(dir, i + '.png'), Buffer.from(bytes));
+  while (Date.now() - startTime < 12000) {
+    if (await isCaptchaSolved(page, prefix)) {
+      log('Cap / UI 验证码无感验证通过！');
+      await page.waitForTimeout(800);
+      return null;
+    }
+
+    const imgCount = await page.locator(root + '.auth-captcha-option-img').count().catch(() => 0);
+    if (imgCount > 0 && await page.locator(root + '.auth-captcha-option-img').first().isVisible().catch(() => false)) {
+      hasImgOptions = true;
+      break;
+    }
+    await page.waitForTimeout(500);
   }
 
-  await shot(page, '02-captcha.png');
-  const pick = await ocrPick(dir, prompt, n);
-  await page.locator(root + '.auth-captcha-option').nth(pick).evaluate((el) => el.click());
+  // 3. 如果弹出了传统的 4 张图片验证码 (.auth-captcha-option-img)，走 OCR 识别
+  if (hasImgOptions) {
+    log('检测到传统图片验证码，启动 OCR 识别...');
+    await page.waitForFunction(
+      (sel) => {
+        const imgs = [...document.querySelectorAll(sel)];
+        return imgs.length > 0 && imgs.every((i) => i.naturalWidth > 0 && i.clientHeight > 0);
+      },
+      root + '.auth-captcha-option-img',
+      { timeout: 15000 }
+    );
 
-  await page.waitForFunction(
-    (sel) => {
-      const cb = document.querySelector(sel);
-      if (!cb) return true;
-      return cb.getAttribute('aria-checked') === 'true';
-    },
-    root + "div[role='checkbox']",
-    { timeout: 15000 }
-  );
-  log('验证码通过: ' + prompt + ' -> option ' + (pick + 1));
+    const promptRaw = await page.locator(root + '.auth-captcha-prompt').first().innerText();
+    const prompt = promptRaw
+      .replace(/^(?:Click on|Cliquez sur|Select|Choisissez)\s*(?:the|le|la|l')?\s*/i, '')
+      .replace(/[.:!?\s]+$/, '')
+      .trim();
+
+    const imgs = page.locator(root + '.auth-captcha-option-img');
+    const n = await imgs.count();
+    const dir = path.join(SHOT, 'captcha');
+    fs.mkdirSync(dir, { recursive: true });
+
+    for (let i = 0; i < n; i++) {
+      const src = await imgs.nth(i).getAttribute('src');
+      const url = src.startsWith('http') ? src : BASE + (src.startsWith('/') ? '' : '/') + src;
+      const bytes = await page.evaluate(async (u) => {
+        const r = await fetch(u, { credentials: 'include' });
+        return Array.from(new Uint8Array(await r.arrayBuffer()));
+      }, url);
+      fs.writeFileSync(path.join(dir, i + '.png'), Buffer.from(bytes));
+    }
+
+    await shot(page, '02-captcha.png');
+    const pick = await ocrPick(dir, prompt, n);
+    await page.locator(root + '.auth-captcha-option').nth(pick).evaluate((el) => el.click());
+
+    await page.waitForTimeout(2000);
+    log('图片验证码点击完成: ' + prompt + ' -> option ' + (pick + 1));
+    return null;
+  }
+
+  // 4. 如果既没有检测到明确通过信号，也没弹出图片，尝试通过 API 获取验证码 Token 并注入表单兜底
+  log('尝试通过 API 求解验证码作为双保险 (context: ' + apiContext + ')...');
+  try {
+    const token = await solveCaptchaApi(page, apiContext);
+    if (token) {
+      await page.evaluate((tk) => {
+        const names = ['captcha_token', 'captcha', 'token', 'cap-token', 'cf-turnstile-response'];
+        const form = document.querySelector('form') || document.body;
+        for (const name of names) {
+          let inp = document.querySelector(`input[name="${name}"]`);
+          if (!inp) {
+            inp = document.createElement('input');
+            inp.type = 'hidden';
+            inp.name = name;
+            form.appendChild(inp);
+          }
+          inp.value = tk;
+          inp.dispatchEvent(new Event('input', { bubbles: true }));
+          inp.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+      }, token);
+      log('成功获取并注入 API 验证码 Token');
+      return token;
+    }
+  } catch (e) {
+    log('API 验证码兜底未返回 token (若 UI Cap 已点击成功可忽略): ' + e.message);
+  }
+
+  if (clicked) {
+    log('已执行 UI 验证码点击，继续后续提交流程');
+    return null;
+  }
+
+  throw new Error('未能定位或通过验证码');
 }
 
 async function solveCaptchaApi(page, context = 'renewal_gate') {
@@ -478,6 +605,7 @@ async function loggedIn(page) {
 }
 
 async function fillLoginCredentials(page) {
+  await dismissCookieBanner(page);
   const userLoc = page.locator('#username, input[name="username"], input[name="email"], input[type="email"], input[type="text"]').first();
   const passLoc = page.locator('#password, input[name="password"], input[type="password"]').first();
   await userLoc.waitFor({ state: 'visible', timeout: 15000 });
@@ -505,31 +633,62 @@ async function login(page) {
   await fillLoginCredentials(page);
   await shot(page, '01-login.png');
 
-  let authed = false;
-  for (let i = 0; i < 4 && !authed; i++) {
+  let loggedInSuccess = false;
+  for (let i = 0; i < 4 && !loggedInSuccess; i++) {
     try {
-      await solveCaptcha(page);
-      authed = true;
+      const capToken = await solveCaptcha(page, '', 'login');
+      await shot(page, '02-after-login-captcha.png');
+
+      const submitBtn = page.locator("button[type='submit'], button:has-text('Sign in'), button:has-text('Login'), input[type='submit']").first();
+      await submitBtn.click();
+
+      const jumped = await page
+        .waitForFunction(() => !window.location.pathname.includes('/auth/login'), { timeout: 15000 })
+        .then(() => true)
+        .catch(() => false);
+
+      if (jumped || (await loggedIn(page))) {
+        loggedInSuccess = true;
+        break;
+      }
+
+      if (capToken) {
+        log('表单提交未跳转，尝试通过 API 直接登录...');
+        await api(
+          page,
+          '/auth/login',
+          'POST',
+          {
+            username: USER,
+            email: USER,
+            password: PASS,
+            captcha_token: capToken,
+            captcha: capToken,
+            token: capToken,
+          },
+          { 'X-Captcha-Token': capToken }
+        );
+        await page.goto(BASE + '/dashboard', { waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
+        if (await loggedIn(page)) {
+          loggedInSuccess = true;
+          break;
+        }
+      }
+
+      const errText = await page.locator('.alert, .error, [role="alert"], .text-red-500').first().innerText().catch(() => '');
+      throw new Error('点击登录后仍停留在登录页' + (errText ? ' (' + errText.trim() + ')' : ''));
     } catch (e) {
-      log('登录验证码失败(' + (i + 1) + '/4): ' + e.message);
-      await page.goto(BASE + '/auth/login', { waitUntil: 'domcontentloaded' });
-      await fillLoginCredentials(page);
+      log('登录尝试失败(' + (i + 1) + '/4): ' + e.message);
+      if (i < 3) {
+        await page.goto(BASE + '/auth/login', { waitUntil: 'domcontentloaded' });
+        await fillLoginCredentials(page);
+      }
     }
   }
-  if (!authed) throw new Error('登录验证码连续 4 次失败');
 
-  const submitBtn = page.locator("button[type='submit'], input[type='submit']").first();
-  await submitBtn.click();
-
-  await page
-    .waitForFunction(() => !window.location.pathname.includes('/auth/login'), { timeout: 25000 })
-    .catch(async () => {
-      if (!(await loggedIn(page))) {
-        const errText = await page.locator('.alert, .error, [role="alert"], .text-red-500').first().innerText().catch(() => '');
-        const extra = errText ? ' (' + errText.trim() + ')' : '';
-        throw new Error('登录后未跳转到 dashboard' + extra);
-      }
-    });
+  if (!loggedInSuccess && !(await loggedIn(page))) {
+    throw new Error('登录连续 4 次失败');
+  }
 
   await page.context().storageState({ path: AUTH });
   log('登录成功,会话写入 ' + AUTH);
@@ -792,8 +951,8 @@ async function navigateToServerRenewPage(page, server) {
     log('访问服务页面: ' + url);
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
     await page.waitForTimeout(2500);
+    await dismissCookieBanner(page);
 
-    // 如果当前页面已经能找到 Renew / Renew now 按钮，或者已经是 /server/{id} 控制台页面，直接停留在当前页
     if (await findVisibleRenewButton(page, server)) {
       return;
     }
@@ -802,7 +961,6 @@ async function navigateToServerRenewPage(page, server) {
       return;
     }
 
-    // 如果在列表页且有 Manage 按钮，尝试点击进入
     const manageBtn = page.locator('a:has-text("Manage"), button:has-text("Manage"), a:has-text("Gérer"), button:has-text("Gérer")').first();
     if (await manageBtn.isVisible().catch(() => false)) {
       log('点击 Manage 按钮进入详情页...');
@@ -822,11 +980,9 @@ async function tryRenew(page, server) {
 
   if (DRY_RUN) return { id, ok: true, skip: true, text: '[DRY_RUN] ' + name + ' (' + id + ') 跳过实际提交' };
 
-  // 1. 直接进入真实的服务器控制台/续期页面 (/server/{id})
   await navigateToServerRenewPage(page, server);
   await shot(page, '05-server-page-' + id + '.png');
 
-  // 检查页面初始文本是否提示“未到续期窗口”
   const initialBody = await page.evaluate(() => document.body.innerText).catch(() => '');
   const notYetMatch = initialBody.match(/Renewal will be available[^\n.]*|renouvellement sera disponible[^\n.]*/i);
   const timeRemMatch = initialBody.match(/(?:Time remaining|Expire dans)\s*:\s*([0-9]+[dj]\s*[0-9]*h?)/i);
@@ -851,30 +1007,27 @@ async function tryRenew(page, server) {
       await page.waitForTimeout(1500);
 
       const hasDialog = (await page.locator("[role='dialog']").count()) > 0 && (await page.locator("[role='dialog']").first().isVisible().catch(() => false));
-      const hasPageCaptcha = await page.locator("div[role='checkbox'], .auth-captcha-option-img").first().isVisible().catch(() => false);
+      const scope = hasDialog ? "[role='dialog']" : '';
 
-      if (hasDialog || hasPageCaptcha) {
-        const scope = hasDialog ? "[role='dialog']" : '';
-        log('检测到防机器人人机验证弹窗 (scope: ' + (scope || 'page') + '), 开始过盾...');
-        try {
-          await solveCaptcha(page, scope);
-          log('验证码已通过，等待自动续期请求完成与页面刷新...');
-          await page.waitForTimeout(4500);
+      log('开始处理续期人机验证 (scope: ' + (scope || 'page') + ')...');
+      try {
+        await solveCaptcha(page, scope, 'renewal_gate');
+        log('验证码处理完毕，等待自动续期请求完成与页面刷新...');
+        await page.waitForTimeout(5000);
 
-          const confirmRoot = hasDialog ? page.locator("[role='dialog']") : page;
-          const confirmBtn = confirmRoot
-            .locator("button[type='submit'], button:has-text('Confirm'), button:has-text('Valider')")
-            .first();
-          if (await confirmBtn.isVisible().catch(() => false)) {
-            await confirmBtn.click().catch(() => {});
-            await page.waitForTimeout(3000);
-          }
-        } catch (e) {
-          log('弹窗验证码处理异常: ' + e.message);
+        const confirmRoot = hasDialog ? page.locator("[role='dialog']") : page;
+        const confirmBtn = confirmRoot
+          .locator("button[type='submit'], button:has-text('Confirm'), button:has-text('Valider')")
+          .first();
+        if (await confirmBtn.isVisible().catch(() => false)) {
+          await confirmBtn.click().catch(() => {});
+          await page.waitForTimeout(3000);
         }
+      } catch (e) {
+        log('弹窗验证码处理异常: ' + e.message);
       }
 
-      // 如果服务之前是 Suspended 恢复后处于 Offline 状态，自动点击右上角 Start 开机
+      // 如果服务从 Suspended 恢复后处于 Offline 状态，自动点击右上角 Start 开机
       const startBtn = page.locator("button:has-text('Start'), button:has-text('Démarrer')").first();
       if (await startBtn.isVisible().catch(() => false)) {
         const isDisabled = await startBtn.isDisabled().catch(() => false);
